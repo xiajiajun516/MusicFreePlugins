@@ -38,89 +38,6 @@ function cleanString(str) {
 }
 
 /**
- * 听音 (Yaohud API) 配置 (全面遵循官方 ES8 及以下兼容规范)
- */
-const YAOHUD_CONFIGS = {
-  kw: {
-    url: "https://api.yaohud.cn/api/music/kuwo",
-    buildParams: function (keyword, quality, key) {
-      const qMap = {
-        "128k": "standard",
-        "320k": "exhigh",
-        flac: "lossless",
-        "hi-res": "hires",
-      };
-      return `key=${key}&msg=${encodeURIComponent(keyword)}&n=1&size=${qMap[quality] || "exhigh"}`;
-    },
-    getUrl: function (data) {
-      return data
-        ? data.url || (data.vipmusic && data.vipmusic.url) || data.music_url
-        : null;
-    },
-  },
-  tx: {
-    url: "https://api.yaohud.cn/api/music/qq_plus",
-    buildParams: function (keyword, quality, key) {
-      const qMap = {
-        "128k": "mp3",
-        "320k": "hq",
-        flac: "sq",
-        "hi-res": "hires",
-      };
-      return `key=${key}&msg=${encodeURIComponent(keyword)}&n=1&size=${qMap[quality] || "hq"}`;
-    },
-    getUrl: function (data, quality) {
-      if (!data) return null;
-      if (data.url) return data.url;
-      if (data.musicurl) return data.musicurl;
-      if (data.music_url) {
-        if (
-          quality === "flac" &&
-          data.music_url.flac &&
-          data.music_url.flac.url
-        )
-          return data.music_url.flac.url;
-        if (
-          quality === "320k" &&
-          data.music_url["320"] &&
-          data.music_url["320"].url
-        )
-          return data.music_url["320"].url;
-        if (quality === "128k" && data.music_url.mp3 && data.music_url.mp3.url)
-          return data.music_url.mp3.url;
-      }
-      return null;
-    },
-  },
-  wy: {
-    url: "https://api.yaohud.cn/api/music/wyvip",
-    buildParams: function (keyword, quality, key) {
-      const qMap = {
-        "128k": "standard",
-        "320k": "exhigh",
-        flac: "lossless",
-        "hi-res": "hires",
-      };
-      return `key=${key}&msg=${encodeURIComponent(keyword)}&n=1&level=${qMap[quality] || "exhigh"}`;
-    },
-    getUrl: function (data) {
-      return data
-        ? data.url || (data.vipmusic && data.vipmusic.url) || data.music_url
-        : null;
-    },
-  },
-  mg: {
-    url: "https://api.yaohud.cn/api/music/migu",
-    buildParams: function (keyword, quality, key) {
-      return `key=${key}&msg=${encodeURIComponent(keyword)}&n=1`;
-    },
-    getUrl: function (data) {
-      return data ? data.music_url || data.url : null;
-    },
-  },
-};
-
-/**
  * 高效纯本地封面直链解析 (零延迟算力转换)
  */
 function resolveArtworkUrlSync(picId, source) {
@@ -569,36 +486,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars) {
   const urlId = (musicItem.extra && musicItem.extra.url_id) || musicItem.id;
   const keyword = `${title} ${artist}`.trim();
 
-  // 1. 听音 (Yaohud API)
-  if (userVars.yaohudKey) {
-    const yaohudSourceMap = {
-      netease: "wy",
-      kuwo: "kw",
-      tencent: "tx",
-      migu: "mg",
-    };
-    const ySource = yaohudSourceMap[source];
-    const cfg = YAOHUD_CONFIGS[ySource];
-    if (cfg) {
-      try {
-        const params = cfg.buildParams(
-          keyword,
-          quality,
-          userVars.yaohudKey.trim(),
-        );
-        const resp = await axios.get(`${cfg.url}?${params}`, {
-          headers: DEFAULT_HEADERS,
-          timeout: 4500,
-        });
-        if (resp.data && resp.data.code === 200 && resp.data.data) {
-          const u = cfg.getUrl(resp.data.data, quality);
-          if (u) return String(u);
-        }
-      } catch (e) {}
-    }
-  }
-
-  // 2. 自定义 API 接口
+  // 1. 自定义 API 接口
   if (userVars.customApiUrl) {
     try {
       const customUrl = userVars.customApiUrl
@@ -606,9 +494,11 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars) {
         .replace("{source}", source)
         .replace("{quality}", quality)
         .replace("{keyword}", encodeURIComponent(keyword));
-      const resp = await axios.get(customUrl, {
-        headers: DEFAULT_HEADERS,
-        timeout: 4500,
+      const resp = await mediaCoalesceGet(source, "custom-resolve", source + "|" + urlId + "|" + quality + "|custom", function () {
+        return axios.get(customUrl, {
+          headers: DEFAULT_HEADERS,
+          timeout: 4500,
+        });
       });
       if (resp.data) {
         const url =
@@ -622,7 +512,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars) {
     } catch (e) {}
   }
 
-  // 3. 仅调用能保留原始平台 ID 与 source 的解析端点；
+  // 2. 仅调用能保留原始平台 ID 与 source 的解析端点；
   // 跨平台关键词/网易云回退没有返回曲目元数据，不能安全替代请求曲目。
   const engineApis = [
     `https://music-api.gdstudio.xyz/api.php?types=url&id=${urlId}&source=${source}`,
@@ -630,9 +520,11 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars) {
 
   for (const apiUrl of engineApis) {
     try {
-      const res = await axios.get(apiUrl, {
-        headers: DEFAULT_HEADERS,
-        timeout: 4000,
+      const res = await mediaCoalesceGet(source, "engine-resolve", source + "|" + urlId, function () {
+        return axios.get(apiUrl, {
+          headers: DEFAULT_HEADERS,
+          timeout: 4000,
+        });
       });
       const data = res ? res.data : null;
       const url = data
@@ -673,12 +565,6 @@ module.exports = {
       name: "显示平台标签后缀",
       title: "显示平台标签后缀",
       hint: "false (默认关闭，歌名保持干净) / true (在歌名后附加 [网易] [酷我] [QQ] [酷狗] 等后缀)",
-    },
-    {
-      key: "yaohudKey",
-      name: "听音 (Yaohud) Key",
-      title: "听音 (Yaohud) Key",
-      hint: "在 https://api.yaohud.cn/ 获取的 Key（可选，填入优先调度）",
     },
     {
       key: "customApiUrl",
@@ -821,10 +707,12 @@ module.exports = {
           try {
             const offset = (pageNum - 1) * pageSize;
             const neteaseSheetUrl = `https://music.163.com/api/v1/search/get?s=${encodeURIComponent(query)}&type=1000&offset=${offset}&limit=${pageSize}`;
-            const res = await axios.get(neteaseSheetUrl, {
-              headers: DEFAULT_HEADERS,
-              timeout: 4500,
-            });
+            const res = await sheetSearchGet("netease", query, pageNum, function () {
+              return axios.get(neteaseSheetUrl, {
+                headers: DEFAULT_HEADERS,
+                timeout: 4500,
+              });
+            }, { cacheKeyVariant: "netease-primary" });
             if (
               res &&
               res.data &&
@@ -864,10 +752,12 @@ module.exports = {
           if (sourceSetting !== "all" && sourceSetting !== "tencent") return [];
           try {
             const qqUrl = `https://c.y.qq.com/soso/fcgi-bin/client_music_search_songlist?remoteplace=txt.yqq.playlist&page=${pageNum - 1}&num=${pageSize}&query=${encodeURIComponent(query)}&format=json`;
-            const res = await axios.get(qqUrl, {
-              headers: Object.assign({}, DEFAULT_HEADERS, { Referer: "https://y.qq.com/" }),
-              timeout: 4500,
-            });
+            const res = await sheetSearchGet("tencent", query, pageNum, function () {
+              return axios.get(qqUrl, {
+                headers: Object.assign({}, DEFAULT_HEADERS, { Referer: "https://y.qq.com/" }),
+                timeout: 4500,
+              });
+            }, { cacheKeyVariant: "tencent-primary" });
             if (res && res.data && res.data.data && res.data.data.list) {
               return res.data.data.list.map(function (item) {
                 const imgUrl = item.imgurl
@@ -902,10 +792,12 @@ module.exports = {
           if (sourceSetting !== "all" && sourceSetting !== "kugou") return [];
           try {
             const kgUrl = `http://mobilecdn.kugou.com/api/v3/search/special?keyword=${encodeURIComponent(query)}&page=${pageNum}&pagesize=${pageSize}`;
-            const res = await axios.get(kgUrl, {
-              headers: DEFAULT_HEADERS,
-              timeout: 4500,
-            });
+            const res = await sheetSearchGet("kugou", query, pageNum, function () {
+              return axios.get(kgUrl, {
+                headers: DEFAULT_HEADERS,
+                timeout: 4500,
+              });
+            }, { cacheKeyVariant: "kugou-primary" });
             if (res && res.data && res.data.data && res.data.data.info) {
               return res.data.data.info.map(function (item) {
                 let imgUrl = item.imgurl || item.user_avatar;
@@ -945,10 +837,12 @@ module.exports = {
           if (sourceSetting !== "all" && sourceSetting !== "kuwo") return [];
           try {
             const kuwoSearchUrl = `https://search.kuwo.cn/r.s?all=${encodeURIComponent(query)}&ft=playlist&itemset=ft&client=kt&pn=${pageNum - 1}&rn=${pageSize}&rformat=json&encoding=utf8`;
-            const res = await axios.get(kuwoSearchUrl, {
-              headers: DEFAULT_HEADERS,
-              timeout: 4500,
-            });
+            const res = await sheetSearchGet("kuwo", query, pageNum, function () {
+              return axios.get(kuwoSearchUrl, {
+                headers: DEFAULT_HEADERS,
+                timeout: 4500,
+              });
+            }, { cacheKeyVariant: "kuwo-primary" });
             const cleanText = (
               typeof res.data === "string" ? res.data : JSON.stringify(res.data)
             ).replace(/'/g, '"');
@@ -1147,10 +1041,12 @@ module.exports = {
       try {
         // 1. 优先尝试调用 v6/playlist/detail 获取包含全量歌曲 ID 的 trackIds 数组
         const v6Url = `https://music.163.com/api/v6/playlist/detail?id=${playlistId}`;
-        const res = await axios.get(v6Url, {
-          headers: DEFAULT_HEADERS,
-          timeout: 4500,
-        });
+        const res = await sheetDetailGet("netease", playlistId, function () {
+          return axios.get(v6Url, {
+            headers: DEFAULT_HEADERS,
+            timeout: 4500,
+          });
+        }, { cacheKeyVariant: "v6" });
 
         if (res && res.data && res.data.playlist) {
           const pl = res.data.playlist;
@@ -1176,11 +1072,14 @@ module.exports = {
             for (let i = 0; i < maxFetchIds.length; i += batchSize) {
               const chunk = maxFetchIds.slice(i, i + batchSize);
               const batchUrl = `https://music.163.com/api/v3/song/detail?c=${encodeURIComponent(JSON.stringify(chunk))}`;
+              const batchIndex = Math.floor(i / batchSize);
               batchPromises.push(
-                axios.get(batchUrl, {
-                  headers: DEFAULT_HEADERS,
-                  timeout: 5000,
-                }),
+                sheetDetailGet("netease", playlistId + "-batch-" + batchIndex, function () {
+                  return axios.get(batchUrl, {
+                    headers: DEFAULT_HEADERS,
+                    timeout: 5000,
+                  });
+                }, { cacheKeyVariant: "v3-batch" }),
               );
             }
 
@@ -1266,10 +1165,12 @@ module.exports = {
 
       // Fallback 到 v1 API
       try {
-        const res = await axios.get(
-          `https://music.163.com/api/playlist/detail?id=${playlistId}`,
-          { headers: DEFAULT_HEADERS, timeout: 4500 },
-        );
+        const res = await sheetDetailGet("netease", playlistId, function () {
+          return axios.get(
+            `https://music.163.com/api/playlist/detail?id=${playlistId}`,
+            { headers: DEFAULT_HEADERS, timeout: 4500 },
+          );
+        }, { cacheKeyVariant: "v1" });
         if (res && res.data && res.data.result && res.data.result.tracks) {
           const tracks = res.data.result.tracks;
           const musicList = tracks.map(function (item) {
@@ -1322,10 +1223,12 @@ module.exports = {
     if (source === "tencent" && playlistId) {
       try {
         const qqPlUrl = `https://c.y.qq.com/v8/fcg-bin/fcg_v8_playlist_cp.fcg?g_tk=5381&disstid=${playlistId}&format=json`;
-        const res = await axios.get(qqPlUrl, {
-          headers: Object.assign({}, DEFAULT_HEADERS, { Referer: "https://y.qq.com/" }),
-          timeout: 6000,
-        });
+        const res = await sheetDetailGet("tencent", playlistId, function () {
+          return axios.get(qqPlUrl, {
+            headers: Object.assign({}, DEFAULT_HEADERS, { Referer: "https://y.qq.com/" }),
+            timeout: 6000,
+          });
+        }, { cacheKeyVariant: "primary" });
         if (
           res &&
           res.data &&
@@ -1379,10 +1282,12 @@ module.exports = {
     if (source === "kugou" && playlistId) {
       try {
         const kgPlUrl = `http://mobilecdn.kugou.com/api/v3/special/song?specialid=${playlistId}&page=1&pagesize=100`;
-        const res = await axios.get(kgPlUrl, {
-          headers: DEFAULT_HEADERS,
-          timeout: 6000,
-        });
+        const res = await sheetDetailGet("kugou", playlistId, function () {
+          return axios.get(kgPlUrl, {
+            headers: DEFAULT_HEADERS,
+            timeout: 6000,
+          });
+        }, { cacheKeyVariant: "primary" });
         if (res && res.data && res.data.data && res.data.data.info) {
           const tracks = res.data.data.info;
           const musicList = tracks.map(function (item) {
