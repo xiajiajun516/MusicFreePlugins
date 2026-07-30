@@ -16,7 +16,19 @@
 
 ## 使用
 
-1. 获取 `musicfree-aggregate-plugin.js`。
+**从网络安装（推荐）：**
+
+在 MusicFree 的插件管理界面选择「从 URL 安装插件」，粘贴以下地址：
+
+```
+https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree-aggregate-plugin.js
+```
+
+安装后可在插件管理中一键更新。
+
+**手动导入：**
+
+1. 下载 `musicfree-aggregate-plugin.js`。
 2. 在 MusicFree 的插件管理界面按其支持的方式导入该脚本。
 3. 如需配置搜索来源或自定义接口，在 MusicFree 的插件配置中填写对应用户变量。
 
