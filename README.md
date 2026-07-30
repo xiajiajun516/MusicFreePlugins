@@ -10,7 +10,7 @@
 - 支持歌曲、专辑、歌手、歌单搜索
 - 支持导入网易云音乐歌单或单曲链接/ID
 - 支持歌词获取
-- 支持在 MusicFree 中配置可选的第三方服务 Key 或自定义接口
+- 支持在 MusicFree 中配置可选的自定义接口
 
 服务可用性取决于相关服务及其接口；本项目不保证任何来源持续可用。
 
@@ -18,7 +18,7 @@
 
 1. 获取 `musicfree-aggregate-plugin.js`。
 2. 在 MusicFree 的插件管理界面按其支持的方式导入该脚本。
-3. 如需配置搜索来源、第三方服务 Key 或自定义接口，在 MusicFree 的插件配置中填写对应用户变量。
+3. 如需配置搜索来源或自定义接口，在 MusicFree 的插件配置中填写对应用户变量。
 
 ## 发布内容
 
@@ -38,7 +38,6 @@
 | --- | --- |
 | `searchSource` | 默认搜索来源：`all`、`netease`、`kuwo`、`tencent` 或 `kugou` |
 | `showBadge` | 是否在歌曲名称后显示来源标签：`true` / `false` |
-| `yaohudKey` | 可选的第三方服务 Key；请自行申请并保管 |
 | `customApiUrl` | 可选的自定义接口模板，支持 `{id}`、`{source}`、`{quality}`、`{keyword}` 占位符 |
 
 ## 许可证与署名
