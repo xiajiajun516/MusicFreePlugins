@@ -1,0 +1,18 @@
+MusicFreePlugins
+Copyright 2026 MusicFreePlugins contributors
+
+This product includes modified source code derived from:
+
+  lxmusic-
+  https://github.com/guoyue2010/lxmusic-
+
+The derived work has been adapted for use as a MusicFree-compatible plugin.
+Modifications include plugin-interface adaptation and multi-source music
+metadata, playlist, lyric, and playback-source integration.
+
+The upstream work and this distribution are licensed under the Apache License,
+Version 2.0. See the accompanying LICENSE file for the complete terms.
+
+MusicFree and the names of third-party music services are referenced only to
+describe compatibility or data-source integration. They do not imply official
+affiliation, endorsement, or authorization.
