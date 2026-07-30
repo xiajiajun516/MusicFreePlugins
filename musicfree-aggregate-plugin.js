@@ -534,10 +534,28 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars) {
     } catch (e) {}
   }
 
-  // 2. 仅调用能保留原始平台 ID 与 source 的解析端点；
+  // 2. 酷我音乐直链解析 (antiserver.kuwo.cn 官方 CDN 接口)
+  if (source === "kuwo") {
+    try {
+      var rid = String(urlId).replace("MUSIC_", "");
+      var kuwoDirectUrl = `https://antiserver.kuwo.cn/anti.s?type=convert_url3&rid=${rid}&format=mp3&response=url`;
+      var kwRes = await mediaCoalesceGet(source, "kuwo-direct", source + "|" + urlId, function () {
+        return axios.get(kuwoDirectUrl, {
+          headers: DEFAULT_HEADERS,
+          timeout: 4000,
+        });
+      });
+      if (kwRes && kwRes.data && kwRes.data.code === 200 && kwRes.data.url && typeof kwRes.data.url === "string" && kwRes.data.url.indexOf("http") === 0) {
+        return kwRes.data.url;
+      }
+    } catch (e) {}
+  }
+
+  // 3. 仅调用能保留原始平台 ID 与 source 的解析端点；
   // 跨平台关键词/网易云回退没有返回曲目元数据，不能安全替代请求曲目。
   const engineApis = [
-    `https://music-api.gdstudio.xyz/api.php?types=url&id=${urlId}&source=${source}`,
+    `https://music-api.gdstudio.xyz/api.php?types=url&id=${urlId}&source=${source}&use_xbridge3=true&loader_name=forest&need_sec_link=1&sec_link_scene=im&theme=light`,
+    `https://api.injahow.cn/meting/?type=url&id=${urlId}&server=${source}`,
   ];
 
   for (const apiUrl of engineApis) {
@@ -566,7 +584,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars) {
 module.exports = {
   // ===== 必填规范属性 =====
   platform: "通用聚合音源",
-  version: "2.3.3",
+  version: "2.3.4",
   author: "yzbtdmz1",
   srcUrl: "https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree-aggregate-plugin.js",
   description:
@@ -1056,17 +1074,14 @@ module.exports = {
       (sheetItem.extra && sheetItem.extra.playlistId) || sheetItem.id;
     const pageNum = page && page > 0 ? page : 1;
 
-    // 页码大于 1 时优先返回已缓存的完整歌单 (按 60s TTL 分页)
-    var detailCacheKey = source + "" + playlistId;
+    // 页码大于 1 时: 全量已在第 1 页返回, 后续页返回空列表 + isEnd
+    var detailCacheKey = source + "\u0001" + playlistId;
     if (pageNum > 1) {
       var cached = getPlaylistDetailCache(detailCacheKey);
       if (cached) {
-        var pgSize = 30;
-        var stIdx = (pageNum - 1) * pgSize;
-        var pgdSongs = cached.musicList.slice(stIdx, stIdx + pgSize);
         return {
-          isEnd: stIdx + pgSize >= cached.total,
-          musicList: pgdSongs,
+          isEnd: true,
+          musicList: [],
           sheetItem: cached.sheetItem,
         };
       }
@@ -1185,9 +1200,6 @@ module.exports = {
           });
 
           var v6Total = musicList.length;
-          var v6PageSize = 30;
-          var v6StartIdx = (pageNum - 1) * v6PageSize;
-          var v6Paged = musicList.slice(v6StartIdx, v6StartIdx + v6PageSize);
 
           var v6SheetItem = {
             title: cleanString(pl.name),
@@ -1204,26 +1216,52 @@ module.exports = {
 
           setPlaylistDetailCache(detailCacheKey, musicList, v6Total, v6SheetItem);
 
+          // 第 1 页返回全量歌单; page>1 已在缓存检查中返回空
+          if (pageNum === 1) {
+            return {
+              isEnd: true,
+              musicList: musicList,
+              sheetItem: v6SheetItem,
+            };
+          }
           return {
-            isEnd: v6StartIdx + v6PageSize >= v6Total,
-            musicList: v6Paged,
-            sheetItem: v6SheetItem,
+            isEnd: true,
+            musicList: [],
           };
         }
       } catch (e) {}
 
-      // Fallback 到 v1 API (支持 offset/limit 分页参数)
+      // Fallback 到 v1 API (内部迭代拉取全量曲目, 第 1 页返回全部)
       try {
-        var v1Offset = (pageNum - 1) * 30;
-        var v1Url = "https://music.163.com/api/playlist/detail?id=" + playlistId + "&offset=" + v1Offset + "&limit=30";
-        var res = await sheetDetailGet("netease", playlistId, function () {
-          return axios.get(v1Url, { headers: DEFAULT_HEADERS, timeout: 4500 });
-        }, { cacheKeyVariant: "v1-offset-" + pageNum });
-        if (res && res.data && res.data.result && res.data.result.tracks) {
-          var tracks = res.data.result.tracks;
-          var v1Total = res.data.result.trackCount || tracks.length;
-          var v1PageSize = 30;
-          var musicList = tracks.map(function (item) {
+        var v1AllTracks = [];
+        var v1Total = 0;
+        var v1Desc = "";
+        var v1Limit = 30;
+        var v1Offset = 0;
+        var v1More = true;
+        var v1GotResponse = false;
+
+        while (v1More) {
+          var v1Url = "https://music.163.com/api/playlist/detail?id=" + playlistId + "&offset=" + v1Offset + "&limit=" + v1Limit;
+          var v1Res = await sheetDetailGet("netease", playlistId, function () {
+            return axios.get(v1Url, { headers: DEFAULT_HEADERS, timeout: 4500 });
+          }, { cacheKeyVariant: "v1-offset-" + v1Offset });
+
+          if (v1Res && v1Res.data && v1Res.data.result && Array.isArray(v1Res.data.result.tracks)) {
+            v1GotResponse = true;
+            var v1Tracks = v1Res.data.result.tracks;
+            v1Total = v1Res.data.result.trackCount || v1Tracks.length;
+            v1Desc = cleanString(v1Res.data.result.description) || "";
+            v1AllTracks = v1AllTracks.concat(v1Tracks);
+            v1Offset += v1Limit;
+            v1More = v1Offset < v1Total && v1Tracks.length === v1Limit;
+          } else {
+            v1More = false;
+          }
+        }
+
+        if (v1GotResponse) {
+          var musicList = v1AllTracks.map(function (item) {
             var artistStr = item.artists
               ? item.artists
                   .map(function (a) {
@@ -1256,14 +1294,22 @@ module.exports = {
             };
           });
 
+          var v1SheetItem = {
+            description: v1Desc || "歌单包含 " + v1AllTracks.length + " 首歌曲",
+          };
+          setPlaylistDetailCache(detailCacheKey, musicList, v1AllTracks.length, v1SheetItem);
+
+          // 第 1 页返回全量; page>1 已在缓存检查中返回空
+          if (pageNum === 1) {
+            return {
+              isEnd: true,
+              musicList: musicList,
+              sheetItem: v1SheetItem,
+            };
+          }
           return {
-            isEnd: v1Offset + v1PageSize >= v1Total,
-            musicList: musicList,
-            sheetItem: {
-              description:
-                cleanString(res.data.result.description) ||
-                "歌单包含 " + tracks.length + " 首歌曲",
-            },
+            isEnd: true,
+            musicList: [],
           };
         }
       } catch (e) {}
@@ -1317,9 +1363,6 @@ module.exports = {
           });
 
           var qqTotal = musicList.length;
-          var qqPageSize = 30;
-          var qqStartIdx = (pageNum - 1) * qqPageSize;
-          var qqPaged = musicList.slice(qqStartIdx, qqStartIdx + qqPageSize);
 
           var qqSheetItem = {
             description:
@@ -1328,29 +1371,52 @@ module.exports = {
 
           setPlaylistDetailCache(detailCacheKey, musicList, qqTotal, qqSheetItem);
 
+          // 第 1 页返回全量; page>1 已在缓存检查中返回空
+          if (pageNum === 1) {
+            return {
+              isEnd: true,
+              musicList: musicList,
+              sheetItem: qqSheetItem,
+            };
+          }
           return {
-            isEnd: qqStartIdx + qqPageSize >= qqTotal,
-            musicList: qqPaged,
-            sheetItem: qqSheetItem,
+            isEnd: true,
+            musicList: [],
           };
         }
       } catch (e) {}
     }
 
-    // C. 酷狗音乐歌单 (支持分页参数)
+    // C. 酷狗音乐歌单 (内部迭代拉取全量曲目, 第 1 页返回全部)
     if (source === "kugou" && playlistId) {
       try {
         var kgPageSize = 30;
-        var kgPlUrl = "http://mobilecdn.kugou.com/api/v3/special/song?specialid=" + playlistId + "&page=" + pageNum + "&pagesize=" + kgPageSize;
-        var res = await sheetDetailGet("kugou", playlistId, function () {
-          return axios.get(kgPlUrl, {
-            headers: DEFAULT_HEADERS,
-            timeout: 6000,
-          });
-        }, { cacheKeyVariant: "page-" + pageNum });
-        if (res && res.data && res.data.data && res.data.data.info) {
-          var tracks = res.data.data.info;
-          var musicList = tracks.map(function (item) {
+        var kgAllTracks = [];
+        var kgCurPage = 1;
+        var kgMore = true;
+        var kgSheetDesc = "酷狗音乐精选歌单";
+
+        while (kgMore) {
+          var kgPlUrl = "http://mobilecdn.kugou.com/api/v3/special/song?specialid=" + playlistId + "&page=" + kgCurPage + "&pagesize=" + kgPageSize;
+          var kgRes = await sheetDetailGet("kugou", playlistId, function () {
+            return axios.get(kgPlUrl, {
+              headers: DEFAULT_HEADERS,
+              timeout: 6000,
+            });
+          }, { cacheKeyVariant: "page-" + kgCurPage });
+
+          if (kgRes && kgRes.data && kgRes.data.data && kgRes.data.data.info) {
+            var kgTracks = kgRes.data.data.info;
+            kgAllTracks = kgAllTracks.concat(kgTracks);
+            kgMore = kgTracks.length === kgPageSize;
+            kgCurPage += 1;
+          } else {
+            kgMore = false;
+          }
+        }
+
+        if (kgAllTracks.length > 0) {
+          var musicList = kgAllTracks.map(function (item) {
             var names = (item.filename || item.songname || "").split(" - ");
             var artistStr =
               names.length > 1 ? cleanString(names[0]) : "未知歌手";
@@ -1374,12 +1440,20 @@ module.exports = {
             };
           });
 
+          var kgSheetItem = { description: kgSheetDesc };
+          setPlaylistDetailCache(detailCacheKey, musicList, kgAllTracks.length, kgSheetItem);
+
+          // 第 1 页返回全量; page>1 已在缓存检查中返回空
+          if (pageNum === 1) {
+            return {
+              isEnd: true,
+              musicList: musicList,
+              sheetItem: kgSheetItem,
+            };
+          }
           return {
-            isEnd: tracks.length < kgPageSize,
-            musicList: musicList,
-            sheetItem: {
-              description: "酷狗音乐精选歌单",
-            },
+            isEnd: true,
+            musicList: [],
           };
         }
       } catch (e) {}
