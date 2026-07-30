@@ -568,6 +568,7 @@ module.exports = {
   platform: "通用聚合音源",
   version: "2.3.3",
   author: "yzbtdmz1",
+  srcUrl: "https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree-aggregate-plugin.js",
   description:
     "通用音乐全网聚合音源，严格遵循 MusicFree 官方协议规范，兼容 ES8 及手机原生 JS 引擎。",
   cacheControl: "no-cache",
