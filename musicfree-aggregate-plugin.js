@@ -78,6 +78,28 @@ const requestCache = new Map();
 const requestsInFlight = new Map();
 const requestFailures = [];
 
+const playlistDetailCache = new Map();
+const PLAYLIST_DETAIL_CACHE_MAX = 50;
+
+function getPlaylistDetailCache(key) {
+  var entry = playlistDetailCache.get(key);
+  if (entry && entry.expiresAt > Date.now()) return entry;
+  if (entry) playlistDetailCache.delete(key);
+  return null;
+}
+
+function setPlaylistDetailCache(key, musicList, total, sheetItem) {
+  playlistDetailCache.set(key, {
+    musicList: musicList,
+    total: total,
+    sheetItem: sheetItem,
+    expiresAt: Date.now() + SHEET_DETAIL_TTL_MS,
+  });
+  if (playlistDetailCache.size > PLAYLIST_DETAIL_CACHE_MAX) {
+    playlistDetailCache.delete(playlistDetailCache.keys().next().value);
+  }
+}
+
 function getSearchRequestKey(source, query, page, endpointVariant) {
   return ["search-music", source, endpointVariant || "default", String(query), String(page)].join("\u0001");
 }
@@ -544,7 +566,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars) {
 module.exports = {
   // ===== 必填规范属性 =====
   platform: "通用聚合音源",
-  version: "2.3.2",
+  version: "2.3.3",
   author: "yzbtdmz1",
   description:
     "通用音乐全网聚合音源，严格遵循 MusicFree 官方协议规范，兼容 ES8 及手机原生 JS 引擎。",
@@ -1031,6 +1053,23 @@ module.exports = {
     const source = (sheetItem.extra && sheetItem.extra.source) || "netease";
     const playlistId =
       (sheetItem.extra && sheetItem.extra.playlistId) || sheetItem.id;
+    const pageNum = page && page > 0 ? page : 1;
+
+    // 页码大于 1 时优先返回已缓存的完整歌单 (按 60s TTL 分页)
+    var detailCacheKey = source + "" + playlistId;
+    if (pageNum > 1) {
+      var cached = getPlaylistDetailCache(detailCacheKey);
+      if (cached) {
+        var pgSize = 30;
+        var stIdx = (pageNum - 1) * pgSize;
+        var pgdSongs = cached.musicList.slice(stIdx, stIdx + pgSize);
+        return {
+          isEnd: stIdx + pgSize >= cached.total,
+          musicList: pgdSongs,
+          sheetItem: cached.sheetItem,
+        };
+      }
+    }
 
     // A. 网易云歌单 (基于 v6/playlist/detail 全量 trackIds 提取 + v3/song/detail 批量并发装载)
     if (
@@ -1144,48 +1183,58 @@ module.exports = {
             };
           });
 
+          var v6Total = musicList.length;
+          var v6PageSize = 30;
+          var v6StartIdx = (pageNum - 1) * v6PageSize;
+          var v6Paged = musicList.slice(v6StartIdx, v6StartIdx + v6PageSize);
+
+          var v6SheetItem = {
+            title: cleanString(pl.name),
+            artwork: pl.coverImgUrl
+              ? pl.coverImgUrl.replace("http://", "https://")
+              : DEFAULT_COVERS[0],
+            coverImg: pl.coverImgUrl
+              ? pl.coverImgUrl.replace("http://", "https://")
+              : DEFAULT_COVERS[0],
+            description:
+              cleanString(pl.description) ||
+              "歌单共包含 " + v6Total + " 首歌曲",
+          };
+
+          setPlaylistDetailCache(detailCacheKey, musicList, v6Total, v6SheetItem);
+
           return {
-            isEnd: true,
-            musicList: musicList,
-            sheetItem: {
-              title: cleanString(pl.name),
-              artwork: pl.coverImgUrl
-                ? pl.coverImgUrl.replace("http://", "https://")
-                : DEFAULT_COVERS[0],
-              coverImg: pl.coverImgUrl
-                ? pl.coverImgUrl.replace("http://", "https://")
-                : DEFAULT_COVERS[0],
-              description:
-                cleanString(pl.description) ||
-                `歌单共包含 ${musicList.length} 首歌曲`,
-            },
+            isEnd: v6StartIdx + v6PageSize >= v6Total,
+            musicList: v6Paged,
+            sheetItem: v6SheetItem,
           };
         }
       } catch (e) {}
 
-      // Fallback 到 v1 API
+      // Fallback 到 v1 API (支持 offset/limit 分页参数)
       try {
-        const res = await sheetDetailGet("netease", playlistId, function () {
-          return axios.get(
-            `https://music.163.com/api/playlist/detail?id=${playlistId}`,
-            { headers: DEFAULT_HEADERS, timeout: 4500 },
-          );
-        }, { cacheKeyVariant: "v1" });
+        var v1Offset = (pageNum - 1) * 30;
+        var v1Url = "https://music.163.com/api/playlist/detail?id=" + playlistId + "&offset=" + v1Offset + "&limit=30";
+        var res = await sheetDetailGet("netease", playlistId, function () {
+          return axios.get(v1Url, { headers: DEFAULT_HEADERS, timeout: 4500 });
+        }, { cacheKeyVariant: "v1-offset-" + pageNum });
         if (res && res.data && res.data.result && res.data.result.tracks) {
-          const tracks = res.data.result.tracks;
-          const musicList = tracks.map(function (item) {
-            const artistStr = item.artists
+          var tracks = res.data.result.tracks;
+          var v1Total = res.data.result.trackCount || tracks.length;
+          var v1PageSize = 30;
+          var musicList = tracks.map(function (item) {
+            var artistStr = item.artists
               ? item.artists
                   .map(function (a) {
                     return cleanString(a.name);
                   })
                   .join(" / ")
               : "未知歌手";
-            const cover =
+            var cover =
               item.album && item.album.picUrl
                 ? item.album.picUrl.replace("http://", "https://")
                 : DEFAULT_COVERS[0];
-            const durationSec = item.duration
+            var durationSec = item.duration
               ? Math.round(item.duration / 1000)
               : 0;
 
@@ -1207,12 +1256,12 @@ module.exports = {
           });
 
           return {
-            isEnd: true,
+            isEnd: v1Offset + v1PageSize >= v1Total,
             musicList: musicList,
             sheetItem: {
               description:
                 cleanString(res.data.result.description) ||
-                `歌单包含 ${tracks.length} 首歌曲`,
+                "歌单包含 " + tracks.length + " 首歌曲",
             },
           };
         }
@@ -1236,17 +1285,17 @@ module.exports = {
           res.data.cdlist[0] &&
           res.data.cdlist[0].songlist
         ) {
-          const tracks = res.data.cdlist[0].songlist;
-          const musicList = tracks.map(function (item) {
-            const artistStr = item.singer
+          var tracks = res.data.cdlist[0].songlist;
+          var musicList = tracks.map(function (item) {
+            var artistStr = item.singer
               ? item.singer
                   .map(function (s) {
                     return cleanString(s.name);
                   })
                   .join(" / ")
               : "未知歌手";
-            const cover = item.albummid
-              ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${item.albummid}.jpg`
+            var cover = item.albummid
+              ? "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + item.albummid + ".jpg"
               : DEFAULT_COVERS[1];
 
             return {
@@ -1266,35 +1315,45 @@ module.exports = {
             };
           });
 
+          var qqTotal = musicList.length;
+          var qqPageSize = 30;
+          var qqStartIdx = (pageNum - 1) * qqPageSize;
+          var qqPaged = musicList.slice(qqStartIdx, qqStartIdx + qqPageSize);
+
+          var qqSheetItem = {
+            description:
+              cleanString(res.data.cdlist[0].desc) || "QQ 音乐精选歌单",
+          };
+
+          setPlaylistDetailCache(detailCacheKey, musicList, qqTotal, qqSheetItem);
+
           return {
-            isEnd: true,
-            musicList: musicList,
-            sheetItem: {
-              description:
-                cleanString(res.data.cdlist[0].desc) || "QQ 音乐精选歌单",
-            },
+            isEnd: qqStartIdx + qqPageSize >= qqTotal,
+            musicList: qqPaged,
+            sheetItem: qqSheetItem,
           };
         }
       } catch (e) {}
     }
 
-    // C. 酷狗音乐歌单
+    // C. 酷狗音乐歌单 (支持分页参数)
     if (source === "kugou" && playlistId) {
       try {
-        const kgPlUrl = `http://mobilecdn.kugou.com/api/v3/special/song?specialid=${playlistId}&page=1&pagesize=100`;
-        const res = await sheetDetailGet("kugou", playlistId, function () {
+        var kgPageSize = 30;
+        var kgPlUrl = "http://mobilecdn.kugou.com/api/v3/special/song?specialid=" + playlistId + "&page=" + pageNum + "&pagesize=" + kgPageSize;
+        var res = await sheetDetailGet("kugou", playlistId, function () {
           return axios.get(kgPlUrl, {
             headers: DEFAULT_HEADERS,
             timeout: 6000,
           });
-        }, { cacheKeyVariant: "primary" });
+        }, { cacheKeyVariant: "page-" + pageNum });
         if (res && res.data && res.data.data && res.data.data.info) {
-          const tracks = res.data.data.info;
-          const musicList = tracks.map(function (item) {
-            const names = (item.filename || item.songname || "").split(" - ");
-            const artistStr =
+          var tracks = res.data.data.info;
+          var musicList = tracks.map(function (item) {
+            var names = (item.filename || item.songname || "").split(" - ");
+            var artistStr =
               names.length > 1 ? cleanString(names[0]) : "未知歌手";
-            const songName =
+            var songName =
               names.length > 1 ? cleanString(names[1]) : cleanString(names[0]);
 
             return {
@@ -1315,7 +1374,7 @@ module.exports = {
           });
 
           return {
-            isEnd: true,
+            isEnd: tracks.length < kgPageSize,
             musicList: musicList,
             sheetItem: {
               description: "酷狗音乐精选歌单",
@@ -1326,7 +1385,6 @@ module.exports = {
     }
 
     // D. 酷我与聚合歌单全量一次性拉取 (同时并发拉取 page 1 与 page 2，一次性返回 40 首全量曲目，并强制 isEnd: true)
-    const pageNum = page && page > 0 ? page : 1;
     if (pageNum > 1) {
       return { isEnd: true, musicList: [] };
     }
