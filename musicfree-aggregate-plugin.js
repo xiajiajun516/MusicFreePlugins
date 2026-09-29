@@ -336,6 +336,7 @@ async function fetchMultiSourceData(query, pageNum, sourceSetting) {
           return axios.get(kuwoUrl, {
             headers: DEFAULT_HEADERS,
             timeout: 4500,
+            family: 4,
           });
         });
         const cleanText = (
@@ -376,24 +377,35 @@ async function fetchMultiSourceData(query, pageNum, sourceSetting) {
     // 3. QQ 音乐
     if (src === "tencent") {
       try {
-        const qqUrl = `https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=${encodeURIComponent(query)}&n=${pageSize}&p=${pageNum}&format=json`;
+        const qqPayload = {
+          comm: { ct: "19", cv: "1859", uin: "0" },
+          req: {
+            method: "DoSearchForQQMusicDesktop",
+            module: "music.search.SearchCgiService",
+            param: {
+              num_per_page: String(pageSize),
+              page_num: String(pageNum),
+              query: query,
+              search_type: 0,
+            },
+          },
+        };
+        const qqUrl = `https://u.y.qq.com/cgi-bin/musicu.fcg?format=json&data=${encodeURIComponent(JSON.stringify(qqPayload))}`;
         const res = await searchMusicGet("tencent", query, pageNum, function () {
           return axios.get(qqUrl, {
             headers: Object.assign({}, DEFAULT_HEADERS, { Referer: "https://y.qq.com/" }),
             timeout: 4500,
           });
         });
-        if (
-          res &&
-          res.data &&
-          res.data.data &&
-          res.data.data.song &&
-          res.data.data.song.list
-        ) {
-          return res.data.data.song.list.map(function (item) {
+        const qqBody =
+          res && res.data && res.data.req && res.data.req.data
+            ? res.data.req.data.body
+            : null;
+        if (qqBody && qqBody.song && qqBody.song.list && qqBody.song.list.length) {
+          return qqBody.song.list.map(function (item) {
             return {
-              id: String(item.songmid || item.songid),
-              name: cleanString(item.songname),
+              id: String(item.mid || item.id),
+              name: cleanString(item.name || item.title),
               artist: item.singer
                 ? item.singer
                     .map(function (s) {
@@ -401,11 +413,11 @@ async function fetchMultiSourceData(query, pageNum, sourceSetting) {
                     })
                     .join(" / ")
                 : "未知歌手",
-              album: cleanString(item.albumname),
+              album: cleanString(item.album && item.album.name),
               source: "tencent",
-              url_id: String(item.songmid || item.songid),
-              lyric_id: String(item.songmid || item.songid),
-              pic_id: item.albummid,
+              url_id: String(item.mid || item.id),
+              lyric_id: String(item.mid || item.id),
+              pic_id: item.album && item.album.mid,
               duration: item.interval ? parseInt(item.interval, 10) : 0,
             };
           });
@@ -499,7 +511,7 @@ async function fetchMultiSourceData(query, pageNum, sourceSetting) {
 /**
  * 瀑布流音频直链解析
  */
-async function fetchMediaUrlFromEngines(musicItem, quality, userVars) {
+async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossSource) {
   const title = cleanString(
     musicItem.title ? musicItem.title.replace(/\[.*?\]/g, "") : "",
   );
@@ -543,10 +555,45 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars) {
         return axios.get(kuwoDirectUrl, {
           headers: DEFAULT_HEADERS,
           timeout: 4000,
+          family: 4,
         });
       });
       if (kwRes && kwRes.data && kwRes.data.code === 200 && kwRes.data.url && typeof kwRes.data.url === "string" && kwRes.data.url.indexOf("http") === 0) {
         return kwRes.data.url;
+      }
+    } catch (e) {}
+  }
+
+  // 2b. QQ 音乐直链解析 (musicu vkey 取链，匿名可解析免费曲目)
+  if (source === "tencent" && urlId) {
+    try {
+      const vkeyPayload = {
+        req_0: {
+          module: "vkey.GetVkeyServer",
+          method: "CgiGetVkey",
+          param: {
+            guid: "10000",
+            songmid: [String(urlId)],
+            songtype: [0],
+            uin: "0",
+            loginflag: 1,
+            platform: "20",
+          },
+        },
+        comm: { uin: 0, format: "json", ct: 24, cv: 0 },
+      };
+      const vkeyUrl = `https://u.y.qq.com/cgi-bin/musicu.fcg?format=json&data=${encodeURIComponent(JSON.stringify(vkeyPayload))}`;
+      const vkRes = await mediaCoalesceGet(source, "tencent-vkey", source + "|" + urlId, function () {
+        return axios.get(vkeyUrl, {
+          headers: Object.assign({}, DEFAULT_HEADERS, { Referer: "https://y.qq.com/" }),
+          timeout: 4000,
+        });
+      });
+      const vkData = vkRes && vkRes.data && vkRes.data.req_0 && vkRes.data.req_0.data;
+      const vkInfo = vkData && vkData.midurlinfo && vkData.midurlinfo[0];
+      if (vkInfo && vkInfo.purl) {
+        const sipList = vkData.sip && vkData.sip.length ? vkData.sip : ["http://aqqmusic.tc.qq.com/"];
+        return String(sipList[0]).replace(/^http:/, "https:") + vkInfo.purl;
       }
     } catch (e) {}
   }
@@ -578,13 +625,81 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars) {
     } catch (e) {}
   }
 
+  // 4. 跨源回退：同一曲目在其它平台再试一次。
+  // 依据 search 阶段按「标题+歌手+时长分桶」合并出的 sourceRecords，元数据已匹配，不会串歌。
+  if (!skipCrossSource) {
+    const records = (musicItem.extra && musicItem.extra.sourceRecords) || [];
+    for (const record of records) {
+      if (!record || !record.source || record.source === source) continue;
+      try {
+        const altItem = {
+          id: record.id,
+          title: title,
+          artist: artist,
+          duration: record.duration || 0,
+          extra: {
+            source: record.source,
+            url_id: record.url_id || record.id,
+            lyric_id: record.lyric_id || record.id,
+          },
+        };
+        const altUrl = await fetchMediaUrlFromEngines(altItem, quality, userVars, true);
+        if (altUrl && typeof altUrl === "string" && altUrl.indexOf("http") === 0) {
+          return altUrl;
+        }
+      } catch (e) {}
+    }
+  }
+
+  // 5. 跨源检索回退：本平台解析不到时，用「歌名 + 首歌手」在可解析平台重新定位同一首。
+  // 严格校验：归一化标题必须完全一致、歌手互相包含、时长差 <= 8 秒，避免串歌。
+  if (!skipCrossSource && title) {
+    const wanted = (title + " " + String(artist).split(" / ")[0]).trim();
+    const matchTitle = title.toLowerCase().replace(/[\s\-_()（）\[\]]/g, "");
+    const matchArtist = String(artist)
+      .split(" / ")[0]
+      .toLowerCase()
+      .replace(/\s+/g, "");
+    for (const altSource of ["netease", "kuwo"]) {
+      if (altSource === source) continue;
+      try {
+        const altList = await fetchMultiSourceData(wanted, 1, altSource);
+        for (const cand of altList) {
+          const candTitle = cleanString(cand.name)
+            .toLowerCase()
+            .replace(/[\s\-_()（）\[\]]/g, "");
+          const candArtist = cleanString(cand.artist).toLowerCase().replace(/\s+/g, "");
+          if (!candTitle || candTitle !== matchTitle) continue;
+          if (!candArtist || !matchArtist) continue;
+          if (candArtist.indexOf(matchArtist) === -1 && matchArtist.indexOf(candArtist) === -1) continue;
+          if (cand.duration && musicItem.duration && Math.abs(cand.duration - musicItem.duration) > 8) continue;
+          const altItem = {
+            id: cand.id,
+            title: title,
+            artist: artist,
+            duration: cand.duration || 0,
+            extra: {
+              source: cand.source,
+              url_id: cand.url_id || cand.id,
+              lyric_id: cand.lyric_id || cand.id,
+            },
+          };
+          const altUrl = await fetchMediaUrlFromEngines(altItem, quality, userVars, true);
+          if (altUrl && typeof altUrl === "string" && altUrl.indexOf("http") === 0) {
+            return altUrl;
+          }
+        }
+      } catch (e) {}
+    }
+  }
+
   throw new Error(`所有解析引擎均未能获取 [${title} - ${artist}] 的音频直链`);
 }
 
 module.exports = {
   // ===== 必填规范属性 =====
   platform: "通用聚合音源",
-  version: "2.3.4",
+  version: "2.3.5",
   author: "yzbtdmz1",
   srcUrl: "https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree-aggregate-plugin.js",
   description:
@@ -882,6 +997,7 @@ module.exports = {
               return axios.get(kuwoSearchUrl, {
                 headers: DEFAULT_HEADERS,
                 timeout: 4500,
+                family: 4,
               });
             }, { cacheKeyVariant: "kuwo-primary" });
             const cleanText = (
