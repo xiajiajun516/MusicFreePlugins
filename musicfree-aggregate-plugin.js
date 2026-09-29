@@ -54,12 +54,6 @@ function resolveArtworkUrlSync(picId, source) {
     }
   }
 
-  if (source === "tencent") {
-    if (picStr.length > 5 && picStr.indexOf("/") === -1) {
-      return `https://y.gtimg.cn/music/photo_new/T002R300x300M000${picStr}.jpg`;
-    }
-  }
-
   if (source === "netease") {
     if (picStr.indexOf("http") === 0)
       return picStr.replace("http://", "https://");
@@ -284,10 +278,52 @@ function getRequestDiagnostics() {
 }
 
 /**
- * 多源并发检索单曲 (网易云, 酷我, QQ音乐, 酷狗 四平台并发聚合与交叉混排)
+ * 多源并发检索单曲 (网易云, 酷我, Audius 并发聚合与交叉混排；受「启用来源」开关控制)
  */
+/**
+ * 方案 B：每个来源一个 true/false 开关（缺省 / 空值视为启用）。
+ * MusicFree 的 userVariables 只有纯文本框，因此用 true/false 文本表达开关。
+ */
+function getEnabledSources() {
+  const candidates = ["netease", "kuwo", "audius"];
+  const keyMap = {
+    netease: "enableNetease",
+    kuwo: "enableKuwo",
+    audius: "enableAudius",
+  };
+  let vars = {};
+  try {
+    if (typeof env !== "undefined" && env.getUserVariables) {
+      vars = env.getUserVariables() || {};
+    }
+  } catch (e) {}
+  const enabled = candidates.filter(function (source) {
+    const value = vars[keyMap[source]];
+    if (value === undefined || value === null || value === "") return true;
+    return !(
+      value === false ||
+      value === 0 ||
+      value === "0" ||
+      value === "false" ||
+      value === "no" ||
+      value === "off"
+    );
+  });
+  // 全部关掉时兜底为全部启用，避免插件变成完全搜不到东西
+  return enabled.length ? enabled : candidates;
+}
+
+/**
+ * 某来源本次是否参与：同时受「默认搜索源模式」与「启用来源」开关约束
+ */
+function isSourceActive(sourceSetting, source) {
+  if (getEnabledSources().indexOf(source) === -1) return false;
+  const setting = (sourceSetting || "all").toLowerCase();
+  return setting === "all" || setting === source;
+}
+
 async function fetchMultiSourceData(query, pageNum, sourceSetting) {
-  const allSources = ["netease", "kuwo", "tencent", "kugou", "audius"];
+  const allSources = getEnabledSources();
   const selectedSetting = (sourceSetting || "all").toLowerCase();
 
   const targetSources =
@@ -411,85 +447,6 @@ async function fetchMultiSourceData(query, pageNum, sourceSetting) {
                 item.hts_pic ||
                 item.albumcover,
               duration: durationSec,
-            };
-          });
-        }
-      } catch (e) {}
-    }
-
-    // 3. QQ 音乐
-    if (src === "tencent") {
-      try {
-        const qqPayload = {
-          comm: { ct: "19", cv: "1859", uin: "0" },
-          req: {
-            method: "DoSearchForQQMusicDesktop",
-            module: "music.search.SearchCgiService",
-            param: {
-              num_per_page: String(pageSize),
-              page_num: String(pageNum),
-              query: query,
-              search_type: 0,
-            },
-          },
-        };
-        const qqUrl = `https://u.y.qq.com/cgi-bin/musicu.fcg?format=json&data=${encodeURIComponent(JSON.stringify(qqPayload))}`;
-        const res = await searchMusicGet("tencent", query, pageNum, function () {
-          return axios.get(qqUrl, {
-            headers: Object.assign({}, DEFAULT_HEADERS, { Referer: "https://y.qq.com/" }),
-            timeout: 4500,
-          });
-        });
-        const qqBody =
-          res && res.data && res.data.req && res.data.req.data
-            ? res.data.req.data.body
-            : null;
-        if (qqBody && qqBody.song && qqBody.song.list && qqBody.song.list.length) {
-          return qqBody.song.list.map(function (item) {
-            return {
-              id: String(item.mid || item.id),
-              name: cleanString(item.name || item.title),
-              artist: item.singer
-                ? item.singer
-                    .map(function (s) {
-                      return cleanString(s.name);
-                    })
-                    .join(" / ")
-                : "未知歌手",
-              album: cleanString(item.album && item.album.name),
-              source: "tencent",
-              url_id: String(item.mid || item.id),
-              lyric_id: String(item.mid || item.id),
-              pic_id: item.album && item.album.mid,
-              duration: item.interval ? parseInt(item.interval, 10) : 0,
-            };
-          });
-        }
-      } catch (e) {}
-    }
-
-    // 4. 酷狗音乐 (采用 HTTP 规避移动端与 Node.js 中的 SSL 证书匹配错误)
-    if (src === "kugou") {
-      try {
-        const kgUrl = `http://mobilecdn.kugou.com/api/v3/search/song?keyword=${encodeURIComponent(query)}&page=${pageNum}&pagesize=${pageSize}`;
-        const res = await searchMusicGet("kugou", query, pageNum, function () {
-          return axios.get(kgUrl, {
-            headers: DEFAULT_HEADERS,
-            timeout: 4500,
-          });
-        });
-        if (res && res.data && res.data.data && res.data.data.info) {
-          return res.data.data.info.map(function (item) {
-            return {
-              id: String(item.hash || item.audio_id),
-              name: cleanString(item.songname || item.filename),
-              artist: cleanString(item.singername || "未知歌手"),
-              album: cleanString(item.album_name),
-              source: "kugou",
-              url_id: String(item.hash),
-              lyric_id: String(item.hash),
-              pic_id: item.album_s_id || item.album_id,
-              duration: item.duration ? parseInt(item.duration, 10) : 0,
             };
           });
         }
@@ -634,40 +591,6 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
     return `https://api.audius.co/v1/tracks/${encodeURIComponent(urlId)}/stream?app_name=MusicFree`;
   }
 
-  // 2b. QQ 音乐直链解析 (musicu vkey 取链，匿名可解析免费曲目)
-  if (source === "tencent" && urlId) {
-    try {
-      const vkeyPayload = {
-        req_0: {
-          module: "vkey.GetVkeyServer",
-          method: "CgiGetVkey",
-          param: {
-            guid: "10000",
-            songmid: [String(urlId)],
-            songtype: [0],
-            uin: "0",
-            loginflag: 1,
-            platform: "20",
-          },
-        },
-        comm: { uin: 0, format: "json", ct: 24, cv: 0 },
-      };
-      const vkeyUrl = `https://u.y.qq.com/cgi-bin/musicu.fcg?format=json&data=${encodeURIComponent(JSON.stringify(vkeyPayload))}`;
-      const vkRes = await mediaCoalesceGet(source, "tencent-vkey", source + "|" + urlId, function () {
-        return axios.get(vkeyUrl, {
-          headers: Object.assign({}, DEFAULT_HEADERS, { Referer: "https://y.qq.com/" }),
-          timeout: 4000,
-        });
-      });
-      const vkData = vkRes && vkRes.data && vkRes.data.req_0 && vkRes.data.req_0.data;
-      const vkInfo = vkData && vkData.midurlinfo && vkData.midurlinfo[0];
-      if (vkInfo && vkInfo.purl) {
-        const sipList = vkData.sip && vkData.sip.length ? vkData.sip : ["http://aqqmusic.tc.qq.com/"];
-        return String(sipList[0]).replace(/^http:/, "https:") + vkInfo.purl;
-      }
-    } catch (e) {}
-  }
-
   // 3. 仅调用能保留原始平台 ID 与 source 的解析端点；
   // 跨平台关键词/网易云回退没有返回曲目元数据，不能安全替代请求曲目。
   const engineApis = [
@@ -769,7 +692,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
 module.exports = {
   // ===== 必填规范属性 =====
   platform: "通用聚合音源",
-  version: "2.5.0",
+  version: "3.0.0",
   author: "yzbtdmz1",
   srcUrl: "https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree-aggregate-plugin.js",
   description:
@@ -784,13 +707,31 @@ module.exports = {
       key: "searchSource",
       name: "默认搜索源模式",
       title: "默认搜索源模式",
-      hint: "all (全平台并发聚合搜索，默认) / netease / kuwo / tencent / kugou / audius",
+      hint: "all (按下方开关并发聚合，默认) / netease / kuwo / audius",
+    },
+    {
+      key: "enableNetease",
+      name: "启用 网易云",
+      title: "启用 网易云",
+      hint: "true (默认启用) / false 关闭；仅在搜索源模式为 all 时生效",
+    },
+    {
+      key: "enableKuwo",
+      name: "启用 酷我",
+      title: "启用 酷我",
+      hint: "true (默认启用) / false 关闭；仅在搜索源模式为 all 时生效",
+    },
+    {
+      key: "enableAudius",
+      name: "启用 Audius",
+      title: "启用 Audius",
+      hint: "true (默认启用) / false 关闭；仅在搜索源模式为 all 时生效",
     },
     {
       key: "showBadge",
       name: "显示平台标签后缀",
       title: "显示平台标签后缀",
-      hint: "false (默认关闭，歌名保持干净) / true (在歌名后附加 [网易] [酷我] [QQ] [酷狗] 等后缀)",
+      hint: "false (默认关闭，歌名保持干净) / true (在歌名后附加 [网易] [酷我] [Audius] 等后缀)",
     },
     {
       key: "customApiUrl",
@@ -807,7 +748,7 @@ module.exports = {
       "支持直接粘贴歌单链接或歌单名称自动搜索导入",
     ],
     importMusicItem: [
-      "支持粘贴单曲 ID（如网易云 186016 or 酷我/QQ 音乐单曲 ID）",
+      "支持粘贴单曲 ID（如网易云 186016 或酷我单曲 ID）",
       "支持直接输入歌曲名 + 歌手名快速导入",
     ],
   },
@@ -825,7 +766,7 @@ module.exports = {
     const showBadge = String(userVars.showBadge).toLowerCase() === "true";
     const pageNum = page && page > 0 ? page : 1;
 
-    // A. 单曲搜索 (网易云, 酷我, QQ音乐, 酷狗 四平台并发检索并交叉混排)
+    // A. 单曲搜索 (网易云, 酷我, Audius 并发检索并交叉混排)
     if (type === "music" || !type) {
       const list = await fetchMultiSourceData(query, pageNum, sourceSetting);
       const data = list.map(function (item) {
@@ -835,8 +776,6 @@ module.exports = {
         const sourceBadgeMap = {
           netease: "网易",
           kuwo: "酷我",
-          tencent: "QQ",
-          kugou: "酷狗",
           audius: "Audius",
         };
         const badge =
@@ -875,8 +814,6 @@ module.exports = {
           const sourceBadgeMap = {
             netease: "网易",
             kuwo: "酷我",
-            tencent: "QQ",
-            kugou: "酷狗",
             audius: "Audius",
           };
           const badge = sourceBadgeMap[src]
@@ -903,7 +840,7 @@ module.exports = {
       const artistMap = new Map();
 
       // C0. Audius 音乐人：直接查用户库，拿官方头像与作品数（比从曲目反推更准）
-      if (sourceSetting === "all" || sourceSetting === "audius") {
+      if (isSourceActive(sourceSetting, "audius")) {
         try {
           const audiusArtistOffset = (pageNum - 1) * 10;
           const audiusArtistUrl = `https://api.audius.co/v1/users/search?query=${encodeURIComponent(query)}&app_name=MusicFree&limit=10&offset=${audiusArtistOffset}`;
@@ -964,14 +901,14 @@ module.exports = {
       return { isEnd: true, data: Array.from(artistMap.values()) };
     }
 
-    // D. 歌单四平台并发聚合搜索 (网易云, QQ音乐, 酷狗, 酷我)
+    // D. 歌单并发聚合搜索 (网易云, 酷我, Audius)
     if (type === "sheet") {
       const pageSize = 12;
 
       const sheetPromises = [
         // 1. 网易云 (采用未加密的 v1 search API)
         (async function () {
-          if (sourceSetting !== "all" && sourceSetting !== "netease") return [];
+          if (!isSourceActive(sourceSetting, "netease")) return [];
           try {
             const offset = (pageNum - 1) * pageSize;
             const neteaseSheetUrl = `https://music.163.com/api/v1/search/get?s=${encodeURIComponent(query)}&type=1000&offset=${offset}&limit=${pageSize}`;
@@ -1015,94 +952,9 @@ module.exports = {
           return [];
         })(),
 
-        // 2. QQ 音乐歌单搜索
-        (async function () {
-          if (sourceSetting !== "all" && sourceSetting !== "tencent") return [];
-          try {
-            const qqUrl = `https://c.y.qq.com/soso/fcgi-bin/client_music_search_songlist?remoteplace=txt.yqq.playlist&page=${pageNum - 1}&num=${pageSize}&query=${encodeURIComponent(query)}&format=json`;
-            const res = await sheetSearchGet("tencent", query, pageNum, function () {
-              return axios.get(qqUrl, {
-                headers: Object.assign({}, DEFAULT_HEADERS, { Referer: "https://y.qq.com/" }),
-                timeout: 4500,
-              });
-            }, { cacheKeyVariant: "tencent-primary" });
-            if (res && res.data && res.data.data && res.data.data.list) {
-              return res.data.data.list.map(function (item) {
-                const imgUrl = item.imgurl
-                  ? item.imgurl.replace("http://", "https://")
-                  : DEFAULT_COVERS[1];
-                return {
-                  id: `sheet_tencent_${item.dissid}`,
-                  title: cleanString(item.dissname),
-                  artist: `QQ音乐 · ${cleanString((item.creator && item.creator.name) || "精选")}`,
-                  artwork: imgUrl,
-                  coverImg: imgUrl,
-                  cover: imgUrl,
-                  description:
-                    cleanString(item.introduction) ||
-                    `播放量 ${item.listennum || 50000}`,
-                  playCount: parseInt(item.listennum || 50000, 10),
-                  worksNum: item.song_count || 30,
-                  extra: {
-                    source: "tencent",
-                    playlistId: String(item.dissid),
-                    query: cleanString(item.dissname),
-                  },
-                };
-              });
-            }
-          } catch (e) {}
-          return [];
-        })(),
-
-        // 3. 酷狗音乐歌单搜索
-        (async function () {
-          if (sourceSetting !== "all" && sourceSetting !== "kugou") return [];
-          try {
-            const kgUrl = `http://mobilecdn.kugou.com/api/v3/search/special?keyword=${encodeURIComponent(query)}&page=${pageNum}&pagesize=${pageSize}`;
-            const res = await sheetSearchGet("kugou", query, pageNum, function () {
-              return axios.get(kgUrl, {
-                headers: DEFAULT_HEADERS,
-                timeout: 4500,
-              });
-            }, { cacheKeyVariant: "kugou-primary" });
-            if (res && res.data && res.data.data && res.data.data.info) {
-              return res.data.data.info.map(function (item) {
-                let imgUrl = item.imgurl || item.user_avatar;
-                if (imgUrl && typeof imgUrl === "string") {
-                  imgUrl = imgUrl
-                    .replace("{size}", "400")
-                    .replace("http://", "https://");
-                } else {
-                  imgUrl = DEFAULT_COVERS[2];
-                }
-                return {
-                  id: `sheet_kugou_${item.specialid}`,
-                  title: cleanString(item.specialname),
-                  artist: `酷狗 · ${cleanString(item.nickname || "精选")}`,
-                  artwork: imgUrl,
-                  coverImg: imgUrl,
-                  cover: imgUrl,
-                  description:
-                    cleanString(item.intro) ||
-                    `包含 ${item.songcount || 30} 首单曲`,
-                  playCount: parseInt(item.playcount || 50000, 10),
-                  worksNum: item.songcount || 30,
-                  extra: {
-                    source: "kugou",
-                    playlistId: String(item.specialid),
-                    query: cleanString(item.specialname),
-                  },
-                };
-              });
-            }
-          } catch (e) {}
-          return [];
-        })(),
-
         // 4. 酷我音乐歌单搜索
         (async function () {
-          if (sourceSetting !== "all" && sourceSetting !== "kuwo") return [];
+          if (!isSourceActive(sourceSetting, "kuwo")) return [];
           try {
             const kuwoSearchUrl = `https://search.kuwo.cn/r.s?all=${encodeURIComponent(query)}&ft=playlist&itemset=ft&client=kt&pn=${pageNum - 1}&rn=${pageSize}&rformat=json&encoding=utf8`;
             const res = await sheetSearchGet("kuwo", query, pageNum, function () {
@@ -1167,7 +1019,7 @@ module.exports = {
 
         // 5. Audius 歌单
         (async function () {
-          if (sourceSetting !== "all" && sourceSetting !== "audius") return [];
+          if (!isSourceActive(sourceSetting, "audius")) return [];
           try {
             const offset = (pageNum - 1) * pageSize;
             const audiusSheetUrl = `https://api.audius.co/v1/playlists/search?query=${encodeURIComponent(query)}&app_name=MusicFree&limit=${pageSize}&offset=${offset}`;
@@ -1614,183 +1466,6 @@ module.exports = {
       } catch (e) {}
     }
 
-    // B. QQ 音乐歌单
-    if (source === "tencent" && playlistId) {
-      try {
-        const qqPlUrl = `https://c.y.qq.com/v8/fcg-bin/fcg_v8_playlist_cp.fcg?g_tk=5381&disstid=${playlistId}&format=json`;
-        const res = await sheetDetailGet("tencent", playlistId, function () {
-          return axios.get(qqPlUrl, {
-            headers: Object.assign({}, DEFAULT_HEADERS, { Referer: "https://y.qq.com/" }),
-            timeout: 6000,
-          });
-        }, { cacheKeyVariant: "primary" });
-        if (
-          res &&
-          res.data &&
-          res.data.cdlist &&
-          res.data.cdlist[0] &&
-          res.data.cdlist[0].songlist
-        ) {
-          var tracks = res.data.cdlist[0].songlist;
-          var musicList = tracks.map(function (item) {
-            var artistStr = item.singer
-              ? item.singer
-                  .map(function (s) {
-                    return cleanString(s.name);
-                  })
-                  .join(" / ")
-              : "未知歌手";
-            var cover = item.albummid
-              ? "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + item.albummid + ".jpg"
-              : DEFAULT_COVERS[1];
-
-            return {
-              id: String(item.songmid || item.songid),
-              title: cleanString(item.songname),
-              artist: artistStr,
-              album: cleanString(item.albumname),
-              duration: item.interval ? parseInt(item.interval, 10) : 0,
-              artwork: cover,
-              coverImg: cover,
-              cover: cover,
-              extra: {
-                source: "tencent",
-                url_id: String(item.songmid || item.songid),
-                lyric_id: String(item.songmid || item.songid),
-              },
-            };
-          });
-
-          var qqTotal = musicList.length;
-
-          var qqSheetItem = {
-            description:
-              cleanString(res.data.cdlist[0].desc) || "QQ 音乐精选歌单",
-          };
-
-          setPlaylistDetailCache(detailCacheKey, musicList, qqTotal, qqSheetItem);
-
-          // 第 1 页返回全量; page>1 已在缓存检查中返回空
-          if (pageNum === 1) {
-            return {
-              isEnd: true,
-              musicList: musicList,
-              sheetItem: qqSheetItem,
-            };
-          }
-          return {
-            isEnd: true,
-            musicList: [],
-          };
-        }
-      } catch (e) {}
-    }
-
-    // B2. Audius 歌单（一次返回全部曲目）
-    if (source === "audius" && playlistId) {
-      try {
-        const audiusDetailUrl = `https://api.audius.co/v1/playlists/${encodeURIComponent(playlistId)}/tracks?app_name=MusicFree`;
-        const res = await sheetDetailGet("audius", playlistId, function () {
-          return axios.get(audiusDetailUrl, {
-            headers: DEFAULT_HEADERS,
-            timeout: 6000,
-          });
-        });
-        const list = res && res.data && res.data.data;
-        if (Array.isArray(list) && list.length > 0) {
-          const musicList = list
-            .filter(function (item) {
-              return item && item.is_streamable !== false;
-            })
-            .map(mapAudiusToMusicItem);
-
-          const audiusSheetItem = { description: "Audius 歌单" };
-          setPlaylistDetailCache(detailCacheKey, musicList, list.length, audiusSheetItem);
-
-          if (pageNum === 1) {
-            return {
-              isEnd: true,
-              musicList: musicList,
-              sheetItem: audiusSheetItem,
-            };
-          }
-          return { isEnd: true, musicList: [] };
-        }
-      } catch (e) {}
-    }
-
-    // C. 酷狗音乐歌单 (内部迭代拉取全量曲目, 第 1 页返回全部)
-    if (source === "kugou" && playlistId) {
-      try {
-        var kgPageSize = 30;
-        var kgAllTracks = [];
-        var kgCurPage = 1;
-        var kgMore = true;
-        var kgSheetDesc = "酷狗音乐精选歌单";
-
-        while (kgMore) {
-          var kgPlUrl = "http://mobilecdn.kugou.com/api/v3/special/song?specialid=" + playlistId + "&page=" + kgCurPage + "&pagesize=" + kgPageSize;
-          var kgRes = await sheetDetailGet("kugou", playlistId, function () {
-            return axios.get(kgPlUrl, {
-              headers: DEFAULT_HEADERS,
-              timeout: 6000,
-            });
-          }, { cacheKeyVariant: "page-" + kgCurPage });
-
-          if (kgRes && kgRes.data && kgRes.data.data && kgRes.data.data.info) {
-            var kgTracks = kgRes.data.data.info;
-            kgAllTracks = kgAllTracks.concat(kgTracks);
-            kgMore = kgTracks.length === kgPageSize;
-            kgCurPage += 1;
-          } else {
-            kgMore = false;
-          }
-        }
-
-        if (kgAllTracks.length > 0) {
-          var musicList = kgAllTracks.map(function (item) {
-            var names = (item.filename || item.songname || "").split(" - ");
-            var artistStr =
-              names.length > 1 ? cleanString(names[0]) : "未知歌手";
-            var songName =
-              names.length > 1 ? cleanString(names[1]) : cleanString(names[0]);
-
-            return {
-              id: String(item.hash || item.audio_id),
-              title: songName,
-              artist: artistStr,
-              album: "",
-              duration: item.duration ? parseInt(item.duration, 10) : 0,
-              artwork: DEFAULT_COVERS[2],
-              coverImg: DEFAULT_COVERS[2],
-              cover: DEFAULT_COVERS[2],
-              extra: {
-                source: "kugou",
-                url_id: String(item.hash),
-                lyric_id: String(item.hash),
-              },
-            };
-          });
-
-          var kgSheetItem = { description: kgSheetDesc };
-          setPlaylistDetailCache(detailCacheKey, musicList, kgAllTracks.length, kgSheetItem);
-
-          // 第 1 页返回全量; page>1 已在缓存检查中返回空
-          if (pageNum === 1) {
-            return {
-              isEnd: true,
-              musicList: musicList,
-              sheetItem: kgSheetItem,
-            };
-          }
-          return {
-            isEnd: true,
-            musicList: [],
-          };
-        }
-      } catch (e) {}
-    }
-
     // D. 酷我与聚合歌单全量一次性拉取 (同时并发拉取 page 1 与 page 2，一次性返回 40 首全量曲目，并强制 isEnd: true)
     if (pageNum > 1) {
       return { isEnd: true, musicList: [] };
@@ -1911,7 +1586,7 @@ module.exports = {
 
     try {
       const apiSource =
-        source === "tencent" || source === "kugou" ? "netease" : source;
+        source;
       const res = await lyricGet(apiSource, "lyric-fallback", lyricId, function () {
         return axios.get(
           `https://music-api.gdstudio.xyz/api.php?types=lyric&id=${lyricId}&source=${apiSource}`,
@@ -1975,22 +1650,6 @@ module.exports = {
         ],
       },
       {
-        title: "QQ 音乐榜单",
-        data: [
-          {
-            id: "qq_hot",
-            title: "QQ 音乐热歌榜",
-            artwork:
-              "https://y.gtimg.cn/music/photo_new/T003R300x300M000003b30hZ3q2u1g.jpg",
-            coverImg:
-              "https://y.gtimg.cn/music/photo_new/T003R300x300M000003b30hZ3q2u1g.jpg",
-            cover:
-              "https://y.gtimg.cn/music/photo_new/T003R300x300M000003b30hZ3q2u1g.jpg",
-            extra: { source: "tencent", query: "热歌" },
-          },
-        ],
-      },
-      {
         title: "酷我音乐榜单",
         data: [
           {
@@ -2024,7 +1683,6 @@ module.exports = {
             { id: "3778678", title: "网易热歌榜" },
             { id: "19723756", title: "网易飙升榜" },
             { id: "kuwo_hot", title: "酷我热歌榜" },
-            { id: "qq_hot", title: "QQ热歌榜" },
           ],
         },
       ],
