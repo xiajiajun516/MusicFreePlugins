@@ -68,6 +68,49 @@ function resolveArtworkUrlSync(picId, source) {
   return DEFAULT_COVERS[0];
 }
 
+/**
+ * Audius 曲目 → MusicFree 曲目条目（搜索与音乐人作品共用同一映射）
+ */
+function mapAudiusTrack(item) {
+  const art =
+    (item.artwork && (item.artwork["480x480"] || item.artwork["150x150"])) || "";
+  return {
+    id: String(item.id),
+    name: cleanString(item.title),
+    artist: cleanString(item.user && item.user.name) || "未知艺术家",
+    album: "",
+    source: "audius",
+    url_id: String(item.id),
+    lyric_id: String(item.id),
+    pic_id: art,
+    duration: item.duration ? parseInt(item.duration, 10) : 0,
+  };
+}
+
+/**
+ * Audius 曲目 → MusicFree 对外曲目条目（title/artwork/extra 形态，供歌手作品与歌单详情复用）
+ */
+function mapAudiusToMusicItem(item) {
+  const t = mapAudiusTrack(item);
+  const art = t.pic_id || DEFAULT_COVERS[0];
+  return {
+    id: t.id,
+    title: t.name,
+    artist: t.artist,
+    album: t.album,
+    duration: t.duration,
+    artwork: art,
+    coverImg: art,
+    cover: art,
+    extra: {
+      source: "audius",
+      url_id: t.url_id,
+      lyric_id: t.lyric_id,
+      pic_id: t.pic_id,
+    },
+  };
+}
+
 const SEARCH_REQUEST_TTL_MS = 30000;
 const LYRIC_REQUEST_TTL_MS = 5 * 60 * 1000;
 const SHEET_SEARCH_TTL_MS = 30000;
@@ -470,23 +513,7 @@ async function fetchMultiSourceData(query, pageNum, sourceSetting) {
             .filter(function (item) {
               return item && item.is_streamable !== false;
             })
-            .map(function (item) {
-              const art =
-                (item.artwork &&
-                  (item.artwork["480x480"] || item.artwork["150x150"])) ||
-                "";
-              return {
-                id: String(item.id),
-                name: cleanString(item.title),
-                artist: cleanString(item.user && item.user.name) || "未知艺术家",
-                album: "",
-                source: "audius",
-                url_id: String(item.id),
-                lyric_id: String(item.id),
-                pic_id: art,
-                duration: item.duration ? parseInt(item.duration, 10) : 0,
-              };
-            });
+            .map(mapAudiusTrack);
         }
       } catch (e) {}
     }
@@ -742,7 +769,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
 module.exports = {
   // ===== 必填规范属性 =====
   platform: "通用聚合音源",
-  version: "2.4.0",
+  version: "2.5.0",
   author: "yzbtdmz1",
   srcUrl: "https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree-aggregate-plugin.js",
   description:
@@ -873,8 +900,48 @@ module.exports = {
 
     // C. 歌手搜索
     if (type === "artist") {
-      const list = await fetchMultiSourceData(query, pageNum, sourceSetting);
       const artistMap = new Map();
+
+      // C0. Audius 音乐人：直接查用户库，拿官方头像与作品数（比从曲目反推更准）
+      if (sourceSetting === "all" || sourceSetting === "audius") {
+        try {
+          const audiusArtistOffset = (pageNum - 1) * 10;
+          const audiusArtistUrl = `https://api.audius.co/v1/users/search?query=${encodeURIComponent(query)}&app_name=MusicFree&limit=10&offset=${audiusArtistOffset}`;
+          const res = await searchMusicGet("audius", query, pageNum, function () {
+            return axios.get(audiusArtistUrl, {
+              headers: DEFAULT_HEADERS,
+              timeout: 6000,
+            });
+          }, { cacheKeyVariant: "audius-artist" });
+          const users = res && res.data && res.data.data;
+          if (Array.isArray(users)) {
+            users.forEach(function (u) {
+              if (!u || !u.name) return;
+              const av =
+                (u.profile_picture &&
+                  (u.profile_picture["480x480"] ||
+                    u.profile_picture["150x150"])) ||
+                DEFAULT_COVERS[0];
+              artistMap.set(String(u.id), {
+                id: `audius_artist_${u.id}`,
+                name: cleanString(u.name),
+                avatar: av,
+                artwork: av,
+                coverImg: av,
+                cover: av,
+                description: `Audius 音乐人 · ${u.track_count || 0} 首作品`,
+                extra: {
+                  source: "audius",
+                  artistId: String(u.id),
+                  artistName: cleanString(u.name),
+                },
+              });
+            });
+          }
+        } catch (e) {}
+      }
+
+      const list = await fetchMultiSourceData(query, pageNum, sourceSetting);
       for (const item of list) {
         const artists = item.artist ? item.artist.split(" / ") : ["未知歌手"];
         for (const art of artists) {
@@ -1097,6 +1164,50 @@ module.exports = {
           } catch (e) {}
           return [];
         })(),
+
+        // 5. Audius 歌单
+        (async function () {
+          if (sourceSetting !== "all" && sourceSetting !== "audius") return [];
+          try {
+            const offset = (pageNum - 1) * pageSize;
+            const audiusSheetUrl = `https://api.audius.co/v1/playlists/search?query=${encodeURIComponent(query)}&app_name=MusicFree&limit=${pageSize}&offset=${offset}`;
+            const res = await sheetSearchGet("audius", query, pageNum, function () {
+              return axios.get(audiusSheetUrl, {
+                headers: DEFAULT_HEADERS,
+                timeout: 6000,
+              });
+            }, { cacheKeyVariant: "audius-primary" });
+            const list = res && res.data && res.data.data;
+            if (Array.isArray(list)) {
+              return list.map(function (item) {
+                const img =
+                  (item.artwork &&
+                    (item.artwork["480x480"] || item.artwork["150x150"])) ||
+                  DEFAULT_COVERS[0];
+                const owner = cleanString(item.user && item.user.name) || "Audius";
+                return {
+                  id: `sheet_audius_${item.id}`,
+                  title: cleanString(item.playlist_name),
+                  artist: `Audius · ${owner}`,
+                  artwork: img,
+                  coverImg: img,
+                  cover: img,
+                  description:
+                    cleanString(item.description) ||
+                    `包含 ${item.track_count || 0} 首曲目`,
+                  playCount: item.total_play_count || 0,
+                  worksNum: item.track_count || 0,
+                  extra: {
+                    source: "audius",
+                    playlistId: String(item.id),
+                    query: cleanString(item.playlist_name),
+                  },
+                };
+              });
+            }
+          } catch (e) {}
+          return [];
+        })(),
       ];
 
       const results = await allSettled(sheetPromises);
@@ -1220,6 +1331,33 @@ module.exports = {
 
   // ===== 歌手作品 =====
   async getArtistWorks(artistItem, page, type) {
+    const artistSource = artistItem.extra && artistItem.extra.source;
+    const artistId = artistItem.extra && artistItem.extra.artistId;
+
+    // Audius 音乐人：按 user id 精确拉取作品，避免用名字模糊搜索串到同名艺人
+    if (artistSource === "audius" && artistId) {
+      try {
+        const artistPage = page && page > 0 ? page : 1;
+        const offset = (artistPage - 1) * 20;
+        const audiusWorksUrl = `https://api.audius.co/v1/users/${encodeURIComponent(artistId)}/tracks?app_name=MusicFree&limit=20&offset=${offset}`;
+        const res = await searchMusicGet("audius", "artist-works", artistPage, function () {
+          return axios.get(audiusWorksUrl, {
+            headers: DEFAULT_HEADERS,
+            timeout: 6000,
+          });
+        }, { cacheKeyVariant: "audius-artist-works-" + artistId });
+        const list = res && res.data && res.data.data;
+        if (Array.isArray(list)) {
+          const data = list
+            .filter(function (item) {
+              return item && item.is_streamable !== false;
+            })
+            .map(mapAudiusToMusicItem);
+          return { isEnd: data.length < 20, data: data };
+        }
+      } catch (e) {}
+    }
+
     const query = artistItem.name || artistItem.id;
     const res = await this.search(query, page, type || "music");
     return {
@@ -1544,6 +1682,39 @@ module.exports = {
             isEnd: true,
             musicList: [],
           };
+        }
+      } catch (e) {}
+    }
+
+    // B2. Audius 歌单（一次返回全部曲目）
+    if (source === "audius" && playlistId) {
+      try {
+        const audiusDetailUrl = `https://api.audius.co/v1/playlists/${encodeURIComponent(playlistId)}/tracks?app_name=MusicFree`;
+        const res = await sheetDetailGet("audius", playlistId, function () {
+          return axios.get(audiusDetailUrl, {
+            headers: DEFAULT_HEADERS,
+            timeout: 6000,
+          });
+        });
+        const list = res && res.data && res.data.data;
+        if (Array.isArray(list) && list.length > 0) {
+          const musicList = list
+            .filter(function (item) {
+              return item && item.is_streamable !== false;
+            })
+            .map(mapAudiusToMusicItem);
+
+          const audiusSheetItem = { description: "Audius 歌单" };
+          setPlaylistDetailCache(detailCacheKey, musicList, list.length, audiusSheetItem);
+
+          if (pageNum === 1) {
+            return {
+              isEnd: true,
+              musicList: musicList,
+              sheetItem: audiusSheetItem,
+            };
+          }
+          return { isEnd: true, musicList: [] };
         }
       } catch (e) {}
     }
