@@ -360,8 +360,12 @@ function getRequestDiagnostics() {
  * 多源并发检索单曲 (网易云, 酷我, Audius 并发聚合与交叉混排；受「启用来源」开关控制)
  */
 /**
- * 方案 B：每个来源一个 true/false 开关（缺省 / 空值视为启用）。
+ * 方案 B：每个来源一个 true/false 开关。
  * MusicFree 的 userVariables 只有纯文本框，因此用 true/false 文本表达开关。
+ * 缺省值：netease / kuwo / audius 默认启用；archive 默认**关闭**。
+ * 原因：Internet Archive 是条目级（一场演出）检索，实测对「歌名/主流歌手」几乎没有
+ * 相关结果（周杰伦 / 晴天 / 告白气球 均 0 条；Shape of You 召回的是 18 分钟 jam），
+ * 默认开启会污染整页聚合结果，故改为按需开启（enableArchive=true）。
  */
 function getEnabledSources() {
   const candidates = ["netease", "kuwo", "audius", "archive"];
@@ -371,6 +375,7 @@ function getEnabledSources() {
     audius: "enableAudius",
     archive: "enableArchive",
   };
+  const defaultOff = { archive: true };
   let vars = {};
   try {
     if (typeof env !== "undefined" && env.getUserVariables) {
@@ -379,7 +384,7 @@ function getEnabledSources() {
   } catch (e) {}
   const enabled = candidates.filter(function (source) {
     const value = vars[keyMap[source]];
-    if (value === undefined || value === null || value === "") return true;
+    if (value === undefined || value === null || value === "") return !defaultOff[source];
     return !(
       value === false ||
       value === 0 ||
@@ -389,8 +394,11 @@ function getEnabledSources() {
       value === "off"
     );
   });
-  // 全部关掉时兜底为全部启用，避免插件变成完全搜不到东西
-  return enabled.length ? enabled : candidates;
+  // 全部关掉时兜底为「默认启用」的来源，避免插件变成完全搜不到东西
+  if (enabled.length) return enabled;
+  return candidates.filter(function (source) {
+    return !defaultOff[source];
+  });
 }
 
 /**
@@ -891,7 +899,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
 module.exports = {
   // ===== 必填规范属性 =====
   platform: "通用聚合音源",
-  version: "3.1.0",
+  version: "3.1.1",
   author: "yzbtdmz1",
   srcUrl: "https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree-aggregate-plugin.js",
   description:
@@ -906,7 +914,7 @@ module.exports = {
       key: "searchSource",
       name: "默认搜索源模式",
       title: "默认搜索源模式",
-      hint: "all (按下方开关并发聚合，默认) / netease / kuwo / audius / archive",
+      hint: "all (按下方开关并发聚合，默认) / netease / kuwo / audius / archive（archive 需同时把 enableArchive 设为 true）",
     },
     {
       key: "enableNetease",
@@ -930,7 +938,7 @@ module.exports = {
       key: "enableArchive",
       name: "启用 Internet Archive",
       title: "启用 Internet Archive",
-      hint: "true (默认启用) / false 关闭；仅在搜索源模式为 all 时生效",
+      hint: "false (默认关闭；该来源是现场演出馆藏，按歌名/主流歌手检索基本无相关结果) / true 开启；仅在搜索源模式为 all 时生效",
     },
     {
       key: "showBadge",
