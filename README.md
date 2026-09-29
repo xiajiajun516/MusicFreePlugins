@@ -6,7 +6,7 @@
 
 ## 功能
 
-- 多来源音乐检索与交叉展示（网易云、酷我、Audius、Internet Archive），每个来源可单独开关
+- 多来源音乐检索与交叉展示（网易云、酷我、Audius），每个来源可单独开关
 - 支持歌曲、专辑、歌手、歌单搜索
 - 支持导入网易云音乐歌单或单曲链接/ID
 - 支持歌词获取
@@ -19,27 +19,21 @@
 | 网易云 | ✅ | ✅ | ✅ 全量加载 |
 | 酷我 | ✅ | ✅ | ✅ |
 | Audius | ✅ | ✅ 全长音频 | ✅ |
-| Internet Archive | ⚠️ 默认关闭 | ✅ 全长音频 | — |
 
 > QQ 音乐与酷狗音乐**已从本插件移除**（v3.0.0）。实测播放成功率：QQ 1/6、酷狗 3/12，属于「能搜到但基本播不了」的陷阱来源；移除后其余来源播放成功率均为 100%。相关接口的逆向记录保留在项目技能库中，接口恢复后可重新接入。
+>
+> Internet Archive 在 v3.1.0 接入过、于 **v4.0.0 移除**：它的音频确实匿名、无风控、为全长 MP3（实测 12/12），但官方检索是**条目级**（一个条目 = 一整场演出，索引不含单曲名），`周杰伦` / `晴天` / `告白气球` 均 0 条，`Shape of You` 召回的是 18 分钟 jam —— 属于「取流合格但检索不合格」的来源。完整实测数据见技能库 `platforms.md` 第 8 节。
 
-**播放解析链（按顺序）**：自定义接口 → 酷我官方 CDN → Audius 官方流（302 → CDN）→ Internet Archive 下载端点 → 第三方聚合接口 → **跨源回退**。
+**播放解析链（按顺序）**：自定义接口 → 酷我官方 CDN → Audius 官方流（302 → CDN）→ 第三方聚合接口 → **跨源回退**。
 
 > **Audius**（[audius.co](https://audius.co)）是去中心化音乐平台，其公开 API 无需鉴权、无需登录，返回的是**全长音频流**而非试听片段，适合作为独立音乐/电子/嘻哈类曲目的补充来源。
 > 搜索会过滤掉 `is_streamable === false` 的曲目；播放时直接返回 `/v1/tracks/{id}/stream` 端点，由播放器跟随 302 到 CDN，避免签名过期。
 > 支持曲目 / 音乐人 / 歌单：音乐人走 `/v1/users/search`（官方头像 + 作品数），进艺人页按 user id 精确拉作品；歌单走 `/v1/playlists/search` 与 `/v1/playlists/{id}/tracks`。
 > Audius 无歌词接口，该来源歌词为空（跨源回退命中其它平台时仍可取得歌词）。
 
-> **Internet Archive**（[archive.org](https://archive.org)，Live Music Archive 现场录音馆藏）走站内公开 JSON 接口，无需鉴权与登录，返回**全长 MP3**。
-> 检索用 `services/search/beta/page_production`（`filter_map` 限定 `collection:etree`），再按条目拉 `/metadata/{identifier}` 展开其中的 MP3 音轨（每页最多 3 个条目 × 每个条目最多 5 首）。
-> 播放直接返回 `https://archive.org/download/{identifier}/{fileName}` —— 该端点无时效签名，不需要二次解析；封面用 `https://archive.org/services/img/{identifier}`。
->
-> ⚠️ **该来源默认关闭（`enableArchive=false`），需手动填 `true` 才参与聚合。** 原因是它**只适合按「现场乐队 / 演出」检索，不适合按歌名检索**：官方检索是**条目级**（一个条目 = 一整场演出），索引只覆盖条目的标题/描述/标签，不覆盖单曲名。实测：`周杰伦` / `晴天` / `告白气球` 均 **0 条**；`Shape of You` 召回 5 条全是名为 "Strange Shape" 的乐队的 18 分钟 jam；`Taylor Swift` 召回 11 条全是描述里提到她的别人的录音。另有音轨标题缺失（回落到 `dtb20141107d1t01` 这类文件名）与 "Tuning"（92 分钟）等非歌曲条目。
-> 该来源无歌词接口，歌词为空。
-
 > **跨源回退**：当某来源自身解析不到直链时，会用「歌名 + 歌手」在其它来源重新定位同一首再解析。
 > 回退必须同时满足：归一化歌名完全一致、歌手互相包含、时长差 ≤ 8 秒；任一不满足立即失败，**宁可播不出来也不会串歌**。
-> 跨源回退只在**网易云 / 酷我**两个来源里重新定位同一首（Audius 与 Internet Archive 的条目不参与回退匹配）；不存在严格匹配时宁可失败，也不会用翻唱/改编版顶替。
+> 跨源回退只在另外两个已启用来源里查找同一首；不存在严格匹配时宁可失败，也不会用翻唱/改编版顶替。
 > 服务可用性取决于相关服务及其接口；本项目不保证任何来源持续可用。
 
 ## 使用
@@ -85,17 +79,15 @@ https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree
 
 | 变量 | 说明 |
 | --- | --- |
-| `searchSource` | 默认搜索来源：`all`（按下方开关并发聚合，默认）、`netease`、`kuwo`、`audius` 或 `archive`（`archive` 需同时把 `enableArchive` 设为 `true`，否则回退到全部已启用来源） |
+| `searchSource` | 默认搜索来源：`all`（按下方开关并发聚合，默认）、`netease`、`kuwo` 或 `audius` |
 | `enableNetease` | 是否启用网易云：`true`（默认）/ `false`；仅 `searchSource=all` 时生效 |
 | `enableKuwo` | 是否启用酷我：`true`（默认）/ `false`；仅 `searchSource=all` 时生效 |
 | `enableAudius` | 是否启用 Audius：`true`（默认）/ `false`；仅 `searchSource=all` 时生效 |
-| `enableArchive` | 是否启用 Internet Archive：`false`（**默认关闭**，该来源只适合按现场乐队检索）/ `true`；仅 `searchSource=all` 时生效 |
 | `showBadge` | 是否在歌曲名称后显示来源标签：`true` / `false` |
 | `customApiUrl` | 可选的自定义接口模板，支持 `{id}`、`{source}`、`{quality}`、`{keyword}` 占位符 |
 
 > MusicFree 的插件变量**只有文本框**（协议里 `userVariables` 仅含 `key`/`name`/`hint`，界面渲染为 `input`），没有下拉或多选框，因此「启用来源」用 `true`/`false` 文本表示。
-> 开关缺省值不同：`enableNetease` / `enableKuwo` / `enableAudius` 缺省启用，`enableArchive` **缺省关闭**。
-> 三个默认开关全部填 `false` 时会兜底为「默认启用」的来源，避免插件变得完全搜不到内容（该兜底不会把 `archive` 打开）。
+> 三个开关全部填 `false` 时会兜底为全部启用，避免插件变得完全搜不到内容。
 
 ## 许可证与署名
 
