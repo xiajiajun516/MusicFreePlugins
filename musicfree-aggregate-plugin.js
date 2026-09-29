@@ -244,7 +244,7 @@ function getRequestDiagnostics() {
  * 多源并发检索单曲 (网易云, 酷我, QQ音乐, 酷狗 四平台并发聚合与交叉混排)
  */
 async function fetchMultiSourceData(query, pageNum, sourceSetting) {
-  const allSources = ["netease", "kuwo", "tencent", "kugou"];
+  const allSources = ["netease", "kuwo", "tencent", "kugou", "audius"];
   const selectedSetting = (sourceSetting || "all").toLowerCase();
 
   const targetSources =
@@ -453,6 +453,44 @@ async function fetchMultiSourceData(query, pageNum, sourceSetting) {
       } catch (e) {}
     }
 
+    // 5. Audius（去中心化音乐平台；公开 API 无鉴权，主流为独立/电子/嘻哈曲目，提供全长音频流）
+    if (src === "audius") {
+      try {
+        const audiusOffset = (pageNum - 1) * pageSize;
+        const audiusUrl = `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(query)}&app_name=MusicFree&limit=${pageSize}&offset=${audiusOffset}`;
+        const res = await searchMusicGet("audius", query, pageNum, function () {
+          return axios.get(audiusUrl, {
+            headers: DEFAULT_HEADERS,
+            timeout: 6000,
+          });
+        });
+        const list = res && res.data && res.data.data;
+        if (Array.isArray(list)) {
+          return list
+            .filter(function (item) {
+              return item && item.is_streamable !== false;
+            })
+            .map(function (item) {
+              const art =
+                (item.artwork &&
+                  (item.artwork["480x480"] || item.artwork["150x150"])) ||
+                "";
+              return {
+                id: String(item.id),
+                name: cleanString(item.title),
+                artist: cleanString(item.user && item.user.name) || "未知艺术家",
+                album: "",
+                source: "audius",
+                url_id: String(item.id),
+                lyric_id: String(item.id),
+                pic_id: art,
+                duration: item.duration ? parseInt(item.duration, 10) : 0,
+              };
+            });
+        }
+      } catch (e) {}
+    }
+
     return [];
   });
 
@@ -562,6 +600,11 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
         return kwRes.data.url;
       }
     } catch (e) {}
+  }
+
+  // 2a. Audius 直链解析：`/stream` 由服务端 302 到 CDN，直接交给播放器跟随，避免签名过期
+  if (source === "audius" && urlId) {
+    return `https://api.audius.co/v1/tracks/${encodeURIComponent(urlId)}/stream?app_name=MusicFree`;
   }
 
   // 2b. QQ 音乐直链解析 (musicu vkey 取链，匿名可解析免费曲目)
@@ -699,7 +742,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
 module.exports = {
   // ===== 必填规范属性 =====
   platform: "通用聚合音源",
-  version: "2.3.5",
+  version: "2.4.0",
   author: "yzbtdmz1",
   srcUrl: "https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree-aggregate-plugin.js",
   description:
@@ -714,7 +757,7 @@ module.exports = {
       key: "searchSource",
       name: "默认搜索源模式",
       title: "默认搜索源模式",
-      hint: "all (全平台并发聚合搜索，默认) / netease / kuwo / tencent / kugou",
+      hint: "all (全平台并发聚合搜索，默认) / netease / kuwo / tencent / kugou / audius",
     },
     {
       key: "showBadge",
@@ -767,6 +810,7 @@ module.exports = {
           kuwo: "酷我",
           tencent: "QQ",
           kugou: "酷狗",
+          audius: "Audius",
         };
         const badge =
           showBadge && sourceBadgeMap[src] ? ` [${sourceBadgeMap[src]}]` : "";
@@ -806,6 +850,7 @@ module.exports = {
             kuwo: "酷我",
             tencent: "QQ",
             kugou: "酷狗",
+            audius: "Audius",
           };
           const badge = sourceBadgeMap[src]
             ? ` [${sourceBadgeMap[src]}专辑]`
