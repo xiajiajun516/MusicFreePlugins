@@ -3,6 +3,18 @@
 记录 `musicfree-aggregate-plugin.js` 的对外行为变更。
 版本号写在该脚本的 `version` 字段，遵循语义化版本：**主版本** = 来源集合或用户变量的破坏性变更，**次版本** = 新增来源 / 新能力，**修订号** = 修复。
 
+## [3.1.0] - 2026-09-30
+
+### 新增
+
+- 新增 **Internet Archive**（Live Music Archive 馆藏，`archive`）来源：站内公开 JSON 接口、无需鉴权与登录，返回**全长 MP3**。检索走 `services/search/beta/page_production`（`filter_map` 限定 `collection:etree`），再按条目拉 `/metadata/{identifier}` 展开条目内的 MP3 音轨（每条目最多 5 首、每页最多 20 首）；播放直接返回无时效签名的 `https://archive.org/download/{identifier}/{fileName}`，封面走 `https://archive.org/services/img/{identifier}`。
+- 新增来源开关 `enableArchive`（`true` / `false`，缺省启用）；`searchSource` 新增可选值 `archive`。
+- 实测播放成功率：4 个查询 × 3 条 = **12/12**（`Range: bytes=0-2047` 全部返回 `206` + `audio/mpeg`，`content-range` 总长均为数 MB 级全长音频）。
+
+### 未通过门槛的候选（未接入，实测证据见项目技能库 `platforms.md` 第 8 节）
+
+- Jamendo、KKBOX、SoundCloud、ccMixter、Free Music Archive、StreetVoice、Joox 共 7 个候选未通过「匿名 + 全长 + 稳定」三条门槛。
+
 ## [3.0.0] - 2026-09-30
 
 ### 破坏性变更

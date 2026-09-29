@@ -105,6 +105,84 @@ function mapAudiusToMusicItem(item) {
   };
 }
 
+/**
+ * Internet Archive 元数据字段（creator / collection 等）可能是字符串或数组
+ */
+function archiveFirstText(value) {
+  if (value === undefined || value === null) return "";
+  if (Array.isArray(value)) {
+    const parts = [];
+    for (let i = 0; i < value.length; i++) {
+      const text = cleanString(value[i]);
+      if (text) parts.push(text);
+    }
+    return parts.join(" / ");
+  }
+  return cleanString(value);
+}
+
+/**
+ * 文件名兜底标题：去掉目录与扩展名
+ */
+function archiveTitleFromFileName(fileName) {
+  let base = String(fileName || "");
+  const slash = base.lastIndexOf("/");
+  if (slash !== -1) base = base.slice(slash + 1);
+  return base.replace(/\.[a-zA-Z0-9]+$/, "");
+}
+
+/**
+ * Internet Archive 时长文本（"05:33" / "1:02:03"）转秒
+ */
+function parseArchiveDuration(raw) {
+  let text = raw === undefined || raw === null ? "" : String(raw).trim();
+  if (!text) return 0;
+  text = text.split(".")[0];
+  const parts = text.split(":");
+  let total = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const value = parseInt(parts[i], 10);
+    if (isNaN(value)) return 0;
+    total = total * 60 + value;
+  }
+  return total;
+}
+
+/**
+ * 去掉元数据里附带的前导音轨号（仅当 track 字段与之对应时才剥离，避免误伤真实歌名）
+ */
+function normalizeArchiveTitle(file) {
+  let title = cleanString(file && file.title) || archiveTitleFromFileName(file && file.name);
+  const track = parseInt(file && file.track, 10);
+  if (title && track > 0) {
+    const prefix = new RegExp("^0*" + track + "[\\s\\.\\-_\\)]+");
+    if (prefix.test(title)) {
+      const stripped = title.replace(prefix, "");
+      if (stripped) title = stripped;
+    }
+  }
+  return title;
+}
+
+/**
+ * Internet Archive 条目 → 内部曲目形态
+ * url_id 形如 "identifier|fileName"，播放时直接拼 /download/ 直链，不需要二次解析
+ */
+function mapArchiveTrack(item) {
+  const urlId = String(item.identifier) + "|" + String(item.fileName);
+  return {
+    id: urlId,
+    name: cleanString(item.title) || archiveTitleFromFileName(item.fileName),
+    artist: cleanString(item.artist) || "未知艺术家",
+    album: cleanString(item.album),
+    source: "archive",
+    url_id: urlId,
+    lyric_id: "",
+    pic_id: item.identifier ? "https://archive.org/services/img/" + encodeURIComponent(item.identifier) : "",
+    duration: item.duration || 0,
+  };
+}
+
 const SEARCH_REQUEST_TTL_MS = 30000;
 const LYRIC_REQUEST_TTL_MS = 5 * 60 * 1000;
 const SHEET_SEARCH_TTL_MS = 30000;
@@ -202,8 +280,9 @@ function resilientGet(source, operation, key, request, options) {
   if (requestsInFlight.has(key)) return requestsInFlight.get(key);
 
   const promise = (async function () {
+    const maxAttempts = options && options.maxAttempts ? options.maxAttempts : 2;
     let lastError;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         const response = await request();
         const status = response && response.status;
@@ -221,7 +300,7 @@ function resilientGet(source, operation, key, request, options) {
         return response;
       } catch (error) {
         lastError = error;
-        if (attempt === 0 && isTransientRequestError(error)) {
+        if (attempt + 1 < maxAttempts && isTransientRequestError(error)) {
           await waitForRequestRetry();
           continue;
         }
@@ -285,11 +364,12 @@ function getRequestDiagnostics() {
  * MusicFree 的 userVariables 只有纯文本框，因此用 true/false 文本表达开关。
  */
 function getEnabledSources() {
-  const candidates = ["netease", "kuwo", "audius"];
+  const candidates = ["netease", "kuwo", "audius", "archive"];
   const keyMap = {
     netease: "enableNetease",
     kuwo: "enableKuwo",
     audius: "enableAudius",
+    archive: "enableArchive",
   };
   let vars = {};
   try {
@@ -475,6 +555,110 @@ async function fetchMultiSourceData(query, pageNum, sourceSetting) {
       } catch (e) {}
     }
 
+    // 6. Internet Archive / Live Music Archive（授权现场录音；站内公开 JSON 接口，匿名全长 MP3）
+    if (src === "archive") {
+      try {
+        const archiveItemHits = 3;
+        const archiveTrackCap = 5;
+        // 单次 search 调用有 10 秒沙箱上限：archive.org 单请求耗时波动较大（实测 0.4–3.8s），
+        // 因此搜索只打一次（不重试）、元数据展开加硬预算，宁可少给结果也不拖垮其它来源。
+        const archiveMetaBudgetMs = 3500;
+        const archiveSearchUrl =
+          "https://archive.org/services/search/beta/page_production/?user_query=" +
+          encodeURIComponent(query) +
+          "&hits_per_page=" +
+          archiveItemHits +
+          "&page=" +
+          pageNum +
+          "&filter_map=" +
+          encodeURIComponent('{"collection":{"etree":"inc"}}') +
+          "&aggregations=false&client_url=" +
+          encodeURIComponent("https://archive.org/search?query=" + encodeURIComponent(query));
+        const archiveSearchRes = await searchMusicGet("archive", query, pageNum, function () {
+          return axios.get(archiveSearchUrl, {
+            headers: DEFAULT_HEADERS,
+            timeout: 4500,
+          });
+        }, { maxAttempts: 1 });
+        const archiveBody =
+          archiveSearchRes && archiveSearchRes.data && archiveSearchRes.data.response;
+        const archiveHits =
+          archiveBody &&
+          archiveBody.body &&
+          archiveBody.body.hits &&
+          archiveBody.body.hits.hits;
+        if (!Array.isArray(archiveHits)) return [];
+
+        const archiveIdentifiers = [];
+        archiveHits.slice(0, archiveItemHits).forEach(function (hit) {
+          const identifier = hit && hit.fields && hit.fields.identifier;
+          if (identifier && archiveIdentifiers.indexOf(String(identifier)) === -1) {
+            archiveIdentifiers.push(String(identifier));
+          }
+        });
+
+        // 每条元数据独立落槽：预算内已返回的照常使用，超时的那几条直接跳过（不影响其它来源）
+        const archiveMetaSlots = [];
+        const archiveMetaTasks = archiveIdentifiers.map(function (identifier, index) {
+          archiveMetaSlots[index] = null;
+          const metaUrl = "https://archive.org/metadata/" + encodeURIComponent(identifier);
+          return searchMusicGet("archive", "item-meta", 1, function () {
+            return axios.get(metaUrl, {
+              headers: DEFAULT_HEADERS,
+              timeout: 3000,
+            });
+          }, { cacheKeyVariant: "item-meta:" + identifier }).then(function (value) {
+            archiveMetaSlots[index] = value;
+          }, function () {
+            archiveMetaSlots[index] = null;
+          });
+        });
+        await Promise.race([
+          Promise.all(archiveMetaTasks),
+          new Promise(function (resolve) {
+            setTimeout(resolve, archiveMetaBudgetMs);
+          }),
+        ]);
+
+        const archiveTracks = [];
+        archiveMetaSlots.forEach(function (result) {
+          if (!result || !result.data) return;
+          const meta = result.data;
+          const info = meta.metadata || {};
+          const identifier = String(info.identifier || "");
+          if (!identifier) return;
+          const albumTitle = cleanString(info.title) || identifier;
+          const albumArtist = archiveFirstText(info.creator);
+          const files = Array.isArray(meta.files) ? meta.files : [];
+          const mp3Files = files.filter(function (file) {
+            return file && /\.mp3$/i.test(String(file.name || ""));
+          });
+          mp3Files.sort(function (a, b) {
+            const nameA = String(a.name || "");
+            const nameB = String(b.name || "");
+            if (nameA === nameB) return 0;
+            return nameA < nameB ? -1 : 1;
+          });
+          mp3Files.slice(0, archiveTrackCap).forEach(function (file) {
+            const fileName = String(file.name || "");
+            if (!fileName) return;
+            archiveTracks.push(
+              mapArchiveTrack({
+                identifier: identifier,
+                fileName: fileName,
+                title: normalizeArchiveTitle(file),
+                artist: cleanString(file.creator) || albumArtist,
+                album: cleanString(file.album) || albumTitle,
+                duration: parseArchiveDuration(file.length),
+              }),
+            );
+          });
+        });
+
+        return archiveTracks.slice(0, pageSize * 2);
+      } catch (e) {}
+    }
+
     return [];
   });
 
@@ -591,6 +775,21 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
     return `https://api.audius.co/v1/tracks/${encodeURIComponent(urlId)}/stream?app_name=MusicFree`;
   }
 
+  // 2b. Internet Archive（Live Music Archive）：/download/ 端点即匿名直链，无时效签名，无需二次解析
+  if (source === "archive" && urlId) {
+    const archiveParts = String(urlId).split("|");
+    if (archiveParts.length >= 2 && archiveParts[0] && archiveParts[1]) {
+      const archiveIdentifier = archiveParts.shift();
+      const archiveFileName = archiveParts.join("|");
+      return (
+        "https://archive.org/download/" +
+        encodeURIComponent(archiveIdentifier) +
+        "/" +
+        archiveFileName.split("/").map(encodeURIComponent).join("/")
+      );
+    }
+  }
+
   // 3. 仅调用能保留原始平台 ID 与 source 的解析端点；
   // 跨平台关键词/网易云回退没有返回曲目元数据，不能安全替代请求曲目。
   const engineApis = [
@@ -692,7 +891,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
 module.exports = {
   // ===== 必填规范属性 =====
   platform: "通用聚合音源",
-  version: "3.0.0",
+  version: "3.1.0",
   author: "yzbtdmz1",
   srcUrl: "https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree-aggregate-plugin.js",
   description:
@@ -707,7 +906,7 @@ module.exports = {
       key: "searchSource",
       name: "默认搜索源模式",
       title: "默认搜索源模式",
-      hint: "all (按下方开关并发聚合，默认) / netease / kuwo / audius",
+      hint: "all (按下方开关并发聚合，默认) / netease / kuwo / audius / archive",
     },
     {
       key: "enableNetease",
@@ -728,10 +927,16 @@ module.exports = {
       hint: "true (默认启用) / false 关闭；仅在搜索源模式为 all 时生效",
     },
     {
+      key: "enableArchive",
+      name: "启用 Internet Archive",
+      title: "启用 Internet Archive",
+      hint: "true (默认启用) / false 关闭；仅在搜索源模式为 all 时生效",
+    },
+    {
       key: "showBadge",
       name: "显示平台标签后缀",
       title: "显示平台标签后缀",
-      hint: "false (默认关闭，歌名保持干净) / true (在歌名后附加 [网易] [酷我] [Audius] 等后缀)",
+      hint: "false (默认关闭，歌名保持干净) / true (在歌名后附加 [网易] [酷我] [Audius] [IA] 等后缀)",
     },
     {
       key: "customApiUrl",
@@ -777,6 +982,7 @@ module.exports = {
           netease: "网易",
           kuwo: "酷我",
           audius: "Audius",
+          archive: "IA",
         };
         const badge =
           showBadge && sourceBadgeMap[src] ? ` [${sourceBadgeMap[src]}]` : "";
@@ -815,6 +1021,7 @@ module.exports = {
             netease: "网易",
             kuwo: "酷我",
             audius: "Audius",
+            archive: "IA",
           };
           const badge = sourceBadgeMap[src]
             ? ` [${sourceBadgeMap[src]}专辑]`
@@ -1564,6 +1771,11 @@ module.exports = {
     const source = (musicItem.extra && musicItem.extra.source) || "netease";
     const lyricId =
       (musicItem.extra && musicItem.extra.lyric_id) || musicItem.id;
+
+    // Internet Archive 无歌词接口，直接返回空歌词，不做无谓请求
+    if (source === "archive") {
+      return { rawLrc: "" };
+    }
 
     if (source === "netease" || source === "all") {
       try {
