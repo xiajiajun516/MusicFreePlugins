@@ -1,0 +1,13 @@
+# 仓库内统一使用 LF 行尾。
+# 本机 core.autocrlf=true，若不固定，Git 会在 checkout 时把工作区改成 CRLF，
+# 导致每次提交都出现「LF will be replaced by CRLF」告警并产生无意义 diff。
+* text=auto eol=lf
+
+# 二进制资源不参与行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.gz binary

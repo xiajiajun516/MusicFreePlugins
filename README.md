@@ -52,6 +52,13 @@ https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree
 2. 在 MusicFree 的插件管理界面按其支持的方式导入该脚本。
 3. 如需配置搜索来源或自定义接口，在 MusicFree 的插件配置中填写对应用户变量。
 
+## 版本与发布
+
+- 版本号写在该脚本的 `version` 字段，遵循语义化版本：**主版本** = 来源集合或用户变量的破坏性变更，**次版本** = 新增来源 / 新能力，**修订号** = 修复。
+- 自 `v3.0.0` 起，每次发布都会在仓库打上对应的 `vX.Y.Z` 注解标签，完整变更见 [`CHANGELOG.md`](./CHANGELOG.md)。
+- **安装地址永久固定**为仓库根目录的 `musicfree-aggregate-plugin.js`（`srcUrl` 指向 `master` 分支的该路径）。因此该文件不会被移入子目录或改名——否则所有已安装用户的自动更新都会失效。
+- 发布前须跑通完整的离线 mock 矩阵与端到端验证。
+
 ## 发布内容
 
 公开仓库仅包含插件脚本与相关文档：
@@ -60,6 +67,8 @@ https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree
 - `LICENSE`
 - `NOTICE`
 - `README.md`
+- `CHANGELOG.md`
+- `.gitattributes`
 - `.gitignore`
 
 本地验证脚本 `test-aggregate.js` 已通过 `.gitignore` 排除，不随仓库发布。
