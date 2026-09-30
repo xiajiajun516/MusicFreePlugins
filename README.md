@@ -164,8 +164,6 @@ https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree
 公开仓库仅包含插件脚本与相关文档：
 
 - `musicfree-aggregate-plugin.js`
-- `LICENSE`
-- `NOTICE`
 - `README.md`
 - `CHANGELOG.md`
 - `.gitattributes`
@@ -175,9 +173,9 @@ https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree
 
 ---
 
-## 许可证与声明
+## 声明
 
-本项目采用 [Apache License 2.0](./LICENSE)。完整许可证见 [LICENSE](./LICENSE)，第三方声明见 [NOTICE](./NOTICE)。
+本项目**未附带开源许可证文件**，默认保留所有权利。如需在其它项目中使用或再分发本代码，请先通过 [Issues](../../issues) 联系维护者。
 
 - 本项目**仅提供代码**，不托管、存储或分发任何音频内容。
 - 使用者应确保自己拥有访问、播放或使用相关内容的合法权利，并遵守所在地法律及相关服务条款。
