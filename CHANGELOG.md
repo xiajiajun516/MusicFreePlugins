@@ -18,9 +18,10 @@
 
 - `resilientGet` / `mediaCoalesceGet` 新增可选 `maxAttempts`（缺省仍为 2 次，行为不变）；B 站的取流两步串行流程用 `maxAttempts: 1` 显式关掉重试，避免顶穿单方法 10 秒沙箱上限。
 
-### 未验证
+### 真机验证
 
-- **真机解码**：只验证到 HTTP 层（206 + 全长 + `Referer`），未在 MusicFree 桌面/手机端确认能否解码「无扩展名的 MP4 容器 AAC 音轨」。若真机播不了，把 `enableBilibili` 填 `false` 即可关闭。
+- **真机解码已确认可用**：最初只验证到 HTTP 层（206 + 全长 + `Referer`），对「无扩展名的 MP4 容器 AAC 音轨」能否解码存疑；经在 MusicFree 客户端内实际安装 v4.1.0 播放，**Bilibili 来源可正常使用**。
+- 若在个别设备上遇到无法播放的情况，把 `enableBilibili` 填 `false` 即可关闭该来源。
 
 ### 已否决
 
