@@ -105,6 +105,298 @@ function mapAudiusToMusicItem(item) {
   };
 }
 
+/**
+ * 纯 JS MD5（RFC 1321）—— 插件运行时只允许 require("axios")，故自带实现，用于 B 站 wbi 签名
+ * 输入按 UTF-8 编码，输出 32 位小写 hex。已与 node crypto 对拍 55/55 一致。
+ */
+const MD5_SHIFTS = [
+  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+  5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+  6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+];
+const MD5_SINES = (function () {
+  const table = [];
+  for (let i = 0; i < 64; i++) {
+    table.push(Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296));
+  }
+  return table;
+})();
+
+function md5Utf8Bytes(value) {
+  const text = String(value === undefined || value === null ? "" : value);
+  const out = [];
+  for (let i = 0; i < text.length; i++) {
+    let code = text.charCodeAt(i);
+    if (code < 0x80) {
+      out.push(code);
+    } else if (code < 0x800) {
+      out.push(0xc0 | (code >> 6), 0x80 | (code & 63));
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        code = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
+        i++;
+        out.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 63), 0x80 | ((code >> 6) & 63), 0x80 | (code & 63));
+      } else {
+        out.push(0xef, 0xbf, 0xbd);
+      }
+    } else {
+      out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 63), 0x80 | (code & 63));
+    }
+  }
+  return out;
+}
+
+function md5Hex(value) {
+  const bytes = md5Utf8Bytes(value);
+  const byteLen = bytes.length;
+  const padLen = (((byteLen + 8) >> 6) << 6) + 64;
+  const buf = [];
+  for (let i = 0; i < padLen; i++) buf.push(0);
+  for (let i = 0; i < byteLen; i++) buf[i] = bytes[i];
+  buf[byteLen] = 0x80;
+  const bitLenLo = (byteLen * 8) >>> 0;
+  const bitLenHi = Math.floor(byteLen / 536870912);
+  buf[padLen - 8] = bitLenLo & 255;
+  buf[padLen - 7] = (bitLenLo >>> 8) & 255;
+  buf[padLen - 6] = (bitLenLo >>> 16) & 255;
+  buf[padLen - 5] = (bitLenLo >>> 24) & 255;
+  buf[padLen - 4] = bitLenHi & 255;
+  buf[padLen - 3] = (bitLenHi >>> 8) & 255;
+  buf[padLen - 2] = (bitLenHi >>> 16) & 255;
+  buf[padLen - 1] = (bitLenHi >>> 24) & 255;
+
+  let a0 = 0x67452301;
+  let b0 = 0xefcdab89;
+  let c0 = 0x98badcfe;
+  let d0 = 0x10325476;
+  const words = [];
+  for (let offset = 0; offset < padLen; offset += 64) {
+    for (let i = 0; i < 16; i++) {
+      const base = offset + i * 4;
+      words[i] = buf[base] | (buf[base + 1] << 8) | (buf[base + 2] << 16) | (buf[base + 3] << 24);
+    }
+    let a = a0;
+    let b = b0;
+    let c = c0;
+    let d = d0;
+    for (let i = 0; i < 64; i++) {
+      let f;
+      let g;
+      if (i < 16) {
+        f = (b & c) | (~b & d);
+        g = i;
+      } else if (i < 32) {
+        f = (d & b) | (~d & c);
+        g = (5 * i + 1) % 16;
+      } else if (i < 48) {
+        f = b ^ c ^ d;
+        g = (3 * i + 5) % 16;
+      } else {
+        f = c ^ (b | ~d);
+        g = (7 * i) % 16;
+      }
+      const mixed = (f + a + MD5_SINES[i] + words[g]) | 0;
+      a = d;
+      d = c;
+      c = b;
+      b = (b + ((mixed << MD5_SHIFTS[i]) | (mixed >>> (32 - MD5_SHIFTS[i])))) | 0;
+    }
+    a0 = (a0 + a) | 0;
+    b0 = (b0 + b) | 0;
+    c0 = (c0 + c) | 0;
+    d0 = (d0 + d) | 0;
+  }
+  const digest = [a0, b0, c0, d0];
+  let hex = "";
+  for (let i = 0; i < 4; i++) {
+    for (let j = 0; j < 4; j++) {
+      const byte = (digest[i] >>> (j * 8)) & 255;
+      hex += (byte < 16 ? "0" : "") + byte.toString(16);
+    }
+  }
+  return hex;
+}
+
+/**
+ * ===== Bilibili（视频区）=====
+ * 站内公开接口，无需登录；仅需匿名设备 cookie（x/frontend/finger/spi 下发）与 wbi 签名。
+ */
+const BILIBILI_REFERER = "https://www.bilibili.com/";
+const BILIBILI_MIXIN_ORDER = [
+  46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+  27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+  37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+  22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+];
+const BILIBILI_NAV_TTL_MS = 30 * 60 * 1000;
+const BILIBILI_COOKIE_TTL_MS = 12 * 60 * 60 * 1000;
+// 结果里混有教程 / 鼓谱 / 讲解 / 合集等非歌曲内容，直接剔除，避免污染聚合结果
+const BILIBILI_NOISE_PATTERN = /(教程|教学|鼓谱|吉他谱|曲谱|谱子|乐谱|附谱|伴奏|KTV|讲解|解说|reaction|合集|循环|铃声|教你)/;
+
+function bilibiliHeaders(extra) {
+  return Object.assign({
+    "User-Agent": DEFAULT_HEADERS["User-Agent"],
+    Referer: BILIBILI_REFERER,
+    Accept: "application/json, text/plain, */*",
+  }, extra || {});
+}
+
+function cleanBilibiliText(value) {
+  const text = String(value === undefined || value === null ? "" : value).replace(/<[^>]*>/g, "");
+  return cleanString(text);
+}
+
+function parseBilibiliDuration(raw) {
+  const text = String(raw === undefined || raw === null ? "" : raw).trim();
+  if (!text) return 0;
+  const parts = text.split(":");
+  let total = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const value = parseInt(parts[i], 10);
+    if (isNaN(value)) return 0;
+    total = total * 60 + value;
+  }
+  return total;
+}
+
+/**
+ * 匿名设备 cookie（非登录态）：buvid3 / buvid4 由 spi 接口匿名下发，缓存 12 小时
+ */
+async function getBilibiliCookie() {
+  try {
+    const res = await resilientGet("bilibili", "fingerprint", "bilibili\u0001fingerprint", function () {
+      return axios.get("https://api.bilibili.com/x/frontend/finger/spi", {
+        headers: bilibiliHeaders(),
+        timeout: 2500,
+      });
+    }, { ttlMs: BILIBILI_COOKIE_TTL_MS, maxAttempts: 1 });
+    const data = res && res.data && res.data.data;
+    if (!data || !data.b_3) return "";
+    return (
+      "buvid3=" + data.b_3 + "; buvid4=" + data.b_4 + "; b_nut=" +
+      Math.floor(Date.now() / 1000) + "; CURRENT_FNVAL=4048"
+    );
+  } catch (e) {
+    return "";
+  }
+}
+
+/**
+ * wbi mixinKey：imgKey+subKey 按固定表重排后取前 32 位；keys 每日轮换故只缓存 30 分钟
+ */
+async function getBilibiliMixinKey() {
+  const res = await resilientGet("bilibili", "wbi-nav", "bilibili\u0001wbi-nav", function () {
+    return axios.get("https://api.bilibili.com/x/web-interface/nav", {
+      headers: bilibiliHeaders(),
+      timeout: 2500,
+    });
+  }, { ttlMs: BILIBILI_NAV_TTL_MS, maxAttempts: 1 });
+  const img = res && res.data && res.data.data && res.data.data.wbi_img;
+  if (!img || !img.img_url || !img.sub_url) return "";
+  const imgKey = String(img.img_url).split("/").pop().split(".")[0];
+  const subKey = String(img.sub_url).split("/").pop().split(".")[0];
+  const origin = imgKey + subKey;
+  let key = "";
+  for (let i = 0; i < BILIBILI_MIXIN_ORDER.length; i++) {
+    key += origin.charAt(BILIBILI_MIXIN_ORDER[i]);
+  }
+  return key.slice(0, 32);
+}
+
+/**
+ * wbi 签名（算法已用抓包值对拍 2/2 MATCH）：参数按 key 排序 → 值去 !'()* → w_rid = md5(query + mixinKey)
+ */
+function signBilibiliQuery(params, mixinKey) {
+  const merged = {};
+  for (const name in params) {
+    if (Object.prototype.hasOwnProperty.call(params, name)) merged[name] = params[name];
+  }
+  merged.wts = Math.floor(Date.now() / 1000);
+  const names = Object.keys(merged).sort();
+  const parts = [];
+  for (let i = 0; i < names.length; i++) {
+    const value = String(merged[names[i]]).replace(/[!'()*]/g, "");
+    parts.push(encodeURIComponent(names[i]) + "=" + encodeURIComponent(value));
+  }
+  const query = parts.join("&");
+  return query + "&w_rid=" + md5Hex(query + mixinKey);
+}
+
+function isBilibiliNoise(item) {
+  if (!item) return true;
+  if (BILIBILI_NOISE_PATTERN.test(String(item.title || ""))) return true;
+  const duration = parseBilibiliDuration(item.duration);
+  if (duration > 0 && (duration < 30 || duration > 900)) return true;
+  return false;
+}
+
+/**
+ * Bilibili 视频条目 → 内部曲目形态（url_id = bvid，播放时再取 cid）
+ */
+function mapBilibiliTrack(item) {
+  const pic = item && item.pic ? String(item.pic) : "";
+  let artwork = "";
+  if (pic) {
+    artwork = pic.indexOf("//") === 0 ? "https:" + pic : pic.replace("http://", "https://");
+  }
+  return {
+    id: String(item.bvid),
+    name: cleanBilibiliText(item.title),
+    artist: cleanBilibiliText(item.author) || "未知UP主",
+    album: "",
+    source: "bilibili",
+    url_id: String(item.bvid),
+    lyric_id: "",
+    pic_id: artwork,
+    duration: parseBilibiliDuration(item.duration),
+  };
+}
+
+/**
+ * 解析 Bilibili 播放地址：pagelist 取 cid → wbi 签名 playurl 取 DASH 音轨。
+ * CDN 必须带 Referer（实测无 Referer 一律 403），故返回 headers 一并交给播放器。
+ */
+async function resolveBilibiliMedia(bvid) {
+  const cookie = await getBilibiliCookie();
+  const cookieHeader = cookie ? { Cookie: cookie } : null;
+  const listRes = await mediaCoalesceGet("bilibili", "pagelist", "bvid:" + bvid, function () {
+    return axios.get("https://api.bilibili.com/x/player/pagelist?bvid=" + encodeURIComponent(bvid), {
+      headers: bilibiliHeaders(cookieHeader),
+      timeout: 3500,
+    });
+  }, { maxAttempts: 1 });
+  const pages = listRes && listRes.data && listRes.data.data;
+  const cid = Array.isArray(pages) && pages[0] ? pages[0].cid : null;
+  if (!cid) return null;
+
+  const mixinKey = await getBilibiliMixinKey();
+  if (!mixinKey) return null;
+  const query = signBilibiliQuery({
+    bvid: bvid,
+    cid: cid,
+    fnval: 16,
+    qn: 80,
+    fnver: 0,
+    fourk: 1,
+  }, mixinKey);
+
+  const playRes = await mediaCoalesceGet("bilibili", "playurl", "bvid:" + bvid, function () {
+    return axios.get("https://api.bilibili.com/x/player/wbi/playurl?" + query, {
+      headers: bilibiliHeaders(cookieHeader),
+      timeout: 4000,
+    });
+  }, { maxAttempts: 1 });
+  const dash = playRes && playRes.data && playRes.data.data && playRes.data.data.dash;
+  const audios = dash && Array.isArray(dash.audio) ? dash.audio.slice(0) : [];
+  if (!audios.length) return null;
+  audios.sort(function (a, b) { return (b.bandwidth || 0) - (a.bandwidth || 0); });
+  const url = audios[0].baseUrl || (audios[0].backupUrl && audios[0].backupUrl[0]);
+  if (!url) return null;
+  return { url: url, headers: { Referer: BILIBILI_REFERER } };
+}
+
 const SEARCH_REQUEST_TTL_MS = 30000;
 const LYRIC_REQUEST_TTL_MS = 5 * 60 * 1000;
 const SHEET_SEARCH_TTL_MS = 30000;
@@ -202,8 +494,10 @@ function resilientGet(source, operation, key, request, options) {
   if (requestsInFlight.has(key)) return requestsInFlight.get(key);
 
   const promise = (async function () {
+    // 单方法 10s 沙箱上限下，某些串行多步流程（如 B 站取流）必须能显式关掉重试
+    const maxAttempts = options && options.maxAttempts ? options.maxAttempts : 2;
     let lastError;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         const response = await request();
         const status = response && response.status;
@@ -221,7 +515,7 @@ function resilientGet(source, operation, key, request, options) {
         return response;
       } catch (error) {
         lastError = error;
-        if (attempt === 0 && isTransientRequestError(error)) {
+        if (attempt + 1 < maxAttempts && isTransientRequestError(error)) {
           await waitForRequestRetry();
           continue;
         }
@@ -263,8 +557,8 @@ function sheetDetailGet(source, playlistId, request, options) {
   return resilientGet(source, "sheet-detail", getSheetDetailRequestKey(source, playlistId, options && options.cacheKeyVariant), request, Object.assign({ ttlMs: SHEET_DETAIL_TTL_MS }, options));
 }
 
-function mediaCoalesceGet(source, operation, cohesiveKey, request) {
-  return resilientGet(source, operation, getMediaRequestKey(source, operation, cohesiveKey), request, { ttlMs: 0, isCacheable: function () { return false; } });
+function mediaCoalesceGet(source, operation, cohesiveKey, request, options) {
+  return resilientGet(source, operation, getMediaRequestKey(source, operation, cohesiveKey), request, Object.assign({ ttlMs: 0, isCacheable: function () { return false; } }, options));
 }
 
 function getRequestDiagnostics() {
@@ -285,11 +579,12 @@ function getRequestDiagnostics() {
  * MusicFree 的 userVariables 只有纯文本框，因此用 true/false 文本表达开关。
  */
 function getEnabledSources() {
-  const candidates = ["netease", "kuwo", "audius"];
+  const candidates = ["netease", "kuwo", "audius", "bilibili"];
   const keyMap = {
     netease: "enableNetease",
     kuwo: "enableKuwo",
     audius: "enableAudius",
+    bilibili: "enableBilibili",
   };
   let vars = {};
   try {
@@ -475,6 +770,32 @@ async function fetchMultiSourceData(query, pageNum, sourceSetting) {
       } catch (e) {}
     }
 
+    // 7. Bilibili（视频区；匿名 buvid cookie + wbi 签名，返回 AAC/MP4 音轨）
+    if (src === "bilibili") {
+      try {
+        const bilibiliCookie = await getBilibiliCookie();
+        const bilibiliUrl =
+          "https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=" +
+          encodeURIComponent(query) +
+          "&page=" +
+          pageNum;
+        const res = await searchMusicGet("bilibili", query, pageNum, function () {
+          return axios.get(bilibiliUrl, {
+            headers: bilibiliHeaders(bilibiliCookie ? { Cookie: bilibiliCookie } : null),
+            timeout: 5000,
+          });
+        });
+        const list = res && res.data && res.data.data && res.data.data.result;
+        if (!Array.isArray(list)) return [];
+        return list
+          .filter(function (item) {
+            return item && item.bvid && !isBilibiliNoise(item);
+          })
+          .slice(0, pageSize)
+          .map(mapBilibiliTrack);
+      } catch (e) {}
+    }
+
     return [];
   });
 
@@ -591,6 +912,17 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
     return `https://api.audius.co/v1/tracks/${encodeURIComponent(urlId)}/stream?app_name=MusicFree`;
   }
 
+  // 2b. Bilibili：pagelist 取 cid → wbi 签名 playurl 取 DASH 音轨，并附 CDN 必需的 Referer
+  if (source === "bilibili" && urlId) {
+    const bilibiliBvid = String(urlId).split("|")[0];
+    if (bilibiliBvid) {
+      try {
+        const resolved = await resolveBilibiliMedia(bilibiliBvid);
+        if (resolved && resolved.url) return resolved;
+      } catch (e) {}
+    }
+  }
+
   // 3. 仅调用能保留原始平台 ID 与 source 的解析端点；
   // 跨平台关键词/网易云回退没有返回曲目元数据，不能安全替代请求曲目。
   const engineApis = [
@@ -637,6 +969,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
           },
         };
         const altUrl = await fetchMediaUrlFromEngines(altItem, quality, userVars, true);
+        if (altUrl && typeof altUrl === "object" && altUrl.url) return altUrl;
         if (altUrl && typeof altUrl === "string" && altUrl.indexOf("http") === 0) {
           return altUrl;
         }
@@ -692,7 +1025,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
 module.exports = {
   // ===== 必填规范属性 =====
   platform: "通用聚合音源",
-  version: "4.0.0",
+  version: "4.1.0",
   author: "yzbtdmz1",
   srcUrl: "https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree-aggregate-plugin.js",
   description:
@@ -707,7 +1040,7 @@ module.exports = {
       key: "searchSource",
       name: "默认搜索源模式",
       title: "默认搜索源模式",
-      hint: "all (按下方开关并发聚合，默认) / netease / kuwo / audius",
+      hint: "all (按下方开关并发聚合，默认) / netease / kuwo / audius / bilibili",
     },
     {
       key: "enableNetease",
@@ -728,10 +1061,16 @@ module.exports = {
       hint: "true (默认启用) / false 关闭；仅在搜索源模式为 all 时生效",
     },
     {
+      key: "enableBilibili",
+      name: "启用 Bilibili",
+      title: "启用 Bilibili",
+      hint: "true (默认启用) / false 关闭；仅在搜索源模式为 all 时生效",
+    },
+    {
       key: "showBadge",
       name: "显示平台标签后缀",
       title: "显示平台标签后缀",
-      hint: "false (默认关闭，歌名保持干净) / true (在歌名后附加 [网易] [酷我] [Audius] 等后缀)",
+      hint: "false (默认关闭，歌名保持干净) / true (在歌名后附加 [网易] [酷我] [Audius] [B站] 等后缀)",
     },
     {
       key: "customApiUrl",
@@ -777,6 +1116,7 @@ module.exports = {
           netease: "网易",
           kuwo: "酷我",
           audius: "Audius",
+          bilibili: "B站",
         };
         const badge =
           showBadge && sourceBadgeMap[src] ? ` [${sourceBadgeMap[src]}]` : "";
@@ -815,6 +1155,7 @@ module.exports = {
             netease: "网易",
             kuwo: "酷我",
             audius: "Audius",
+            bilibili: "B站",
           };
           const badge = sourceBadgeMap[src]
             ? ` [${sourceBadgeMap[src]}专辑]`
@@ -1555,8 +1896,14 @@ module.exports = {
       }
     } catch (e) {}
 
-    const url = await fetchMediaUrlFromEngines(musicItem, quality, userVars);
-    return { url: url };
+    const resolved = await fetchMediaUrlFromEngines(musicItem, quality, userVars);
+    // B 站等来源需要随直链下发请求头（CDN 无 Referer 会 403）
+    if (resolved && typeof resolved === "object") {
+      const result = { url: resolved.url };
+      if (resolved.headers) result.headers = resolved.headers;
+      return result;
+    }
+    return { url: resolved };
   },
 
   // ===== 歌词获取 =====
@@ -1564,6 +1911,11 @@ module.exports = {
     const source = (musicItem.extra && musicItem.extra.source) || "netease";
     const lyricId =
       (musicItem.extra && musicItem.extra.lyric_id) || musicItem.id;
+
+    // Bilibili 视频区无歌词接口，直接返回空歌词，不做无谓请求
+    if (source === "bilibili") {
+      return { rawLrc: "" };
+    }
 
     if (source === "netease" || source === "all") {
       try {

@@ -3,6 +3,29 @@
 记录 `musicfree-aggregate-plugin.js` 的对外行为变更。
 版本号写在该脚本的 `version` 字段，遵循语义化版本：**主版本** = 来源集合或用户变量的破坏性变更，**次版本** = 新增来源 / 新能力，**修订号** = 修复。
 
+## [4.1.0] - 2026-09-30
+
+### 新增
+
+- 新增 **Bilibili（视频区）**来源（键 `bilibili`）：无需登录，搜索走 `x/web-interface/search/type`（需 `x/frontend/finger/spi` 匿名下发的 `buvid3`/`buvid4`），播放走 `x/player/pagelist`（取 cid，无需签名）→ `x/player/wbi/playurl`（**wbi 签名**），取 `dash.audio` 中码率最高的音轨直链。
+- 插件内置**纯 JS MD5**（RFC 1321）用于 wbi 签名，维持「运行时只允许 `require("axios")`」约束；实现已与 node `crypto` 对拍 **55/55** 一致，wbi 算法本身已用抓包值对拍 **2/2 MATCH**。
+- **直链必须带 `Referer: https://www.bilibili.com/`**（实测无 Referer 一律 403），因此 `getMediaSource` 现在支持按来源随直链下发请求头。
+- 来源开关 `enableBilibili`（`true` 默认 / `false` 关闭）；`searchSource` 新增取值 `bilibili`。
+- 结果过滤：剔除标题含教程 / 鼓谱 / 伴奏 / KTV / 讲解 / 合集等关键词，以及时长 < 30 秒或 > 15 分钟的非歌曲条目。
+- 实测：搜索 0.5–1.0s、播放解析 0.3–1.1s，**播放成功率 12/12**（4 查询 × 3 条，全部 206 + 全长 1.6–6.7MB）。
+
+### 变更
+
+- `resilientGet` / `mediaCoalesceGet` 新增可选 `maxAttempts`（缺省仍为 2 次，行为不变）；B 站的取流两步串行流程用 `maxAttempts: 1` 显式关掉重试，避免顶穿单方法 10 秒沙箱上限。
+
+### 未验证
+
+- **真机解码**：只验证到 HTTP 层（206 + 全长 + `Referer`），未在 MusicFree 桌面/手机端确认能否解码「无扩展名的 MP4 容器 AAC 音轨」。若真机播不了，把 `enableBilibili` 填 `false` 即可关闭。
+
+### 已否决
+
+- **YouTube**（含 YouTube Music）已定论为否决：ANDROID_VR 客户端对搜索结果 **0/20** 返回 `LOGIN_REQUIRED`，WEB = UNPLAYABLE、IOS = 400；仅个别视频可播（视频级差异，非 IP 限制）。详见技能库 `platforms.md` 第 8 节。
+
 ## [4.0.0] - 2026-09-30
 
 ### 破坏性变更
