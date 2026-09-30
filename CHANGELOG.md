@@ -3,6 +3,18 @@
 记录 `musicfree-aggregate-plugin.js` 的对外行为变更。
 版本号写在该脚本的 `version` 字段，遵循语义化版本：**主版本** = 来源集合或用户变量的破坏性变更，**次版本** = 新增来源 / 新能力，**修订号** = 修复。
 
+## [4.1.3] - 2026-09-30
+
+### 变更
+
+- 新增 `LICENSE`（`MIT License`，Copyright (c) 2026 xiajiajun516），把上一版的「无许可证」状态替换为明确授权。
+- README 的「发布内容」列表加回 `LICENSE`，末尾段落改回「许可证与声明」。
+- 插件代码未改动，仅 `version` 递增以保证发布物自洽。
+
+### 修复
+
+- 修复发版脚本导致的 **Release 备注乱码**：`release.ps1` 用 `Get-Content` 读中文 `CHANGELOG.md` 时未指定编码，PowerShell 5.1 按系统 ANSI 解码后把乱码写进了 Release 备注（`v4.1.1` / `v4.1.2` 中招，现已用正确 UTF-8 重写这两条备注；脚本改为 `-Encoding UTF8` 读、`.NET UTF8Encoding($false)` 写无 BOM）。
+
 ## [4.1.2] - 2026-09-30
 
 ### 变更
