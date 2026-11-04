@@ -358,9 +358,18 @@ function mapBilibiliTrack(item) {
  * 解析 Bilibili 播放地址：pagelist 取 cid → wbi 签名 playurl 取 DASH 音轨。
  * CDN 必须带 Referer（实测无 Referer 一律 403），故返回 headers 一并交给播放器。
  */
-async function resolveBilibiliMedia(bvid) {
-  const cookie = await getBilibiliCookie();
+async function resolveBilibiliMedia(bvid, deadline) {
+  const budget = deadline || createDeadline(PLAYBACK_DEADLINE_MS);
+  if (!hasTimeForStage(budget, 2000)) return null;
+  // 匿名 cookie 与 wbi mixinKey 互不依赖：串行会白等一个 2.5s 超时，这里并行预取。
+  const prefetched = await Promise.all([
+    Promise.resolve().then(getBilibiliCookie).then(null, function () { return ""; }),
+    Promise.resolve().then(getBilibiliMixinKey).then(null, function () { return ""; }),
+  ]);
+  const cookie = prefetched[0];
+  const mixinKey = prefetched[1];
   const cookieHeader = cookie ? { Cookie: cookie } : null;
+  if (!hasTimeForStage(budget, 1400)) return null;
   const listRes = await mediaCoalesceGet("bilibili", "pagelist", "bvid:" + bvid, function () {
     return axios.get("https://api.bilibili.com/x/player/pagelist?bvid=" + encodeURIComponent(bvid), {
       headers: bilibiliHeaders(cookieHeader),
@@ -371,8 +380,8 @@ async function resolveBilibiliMedia(bvid) {
   const cid = Array.isArray(pages) && pages[0] ? pages[0].cid : null;
   if (!cid) return null;
 
-  const mixinKey = await getBilibiliMixinKey();
   if (!mixinKey) return null;
+  if (!hasTimeForStage(budget, 1200)) return null;
   const query = signBilibiliQuery({
     bvid: bvid,
     cid: cid,
@@ -403,6 +412,16 @@ const SHEET_SEARCH_TTL_MS = 30000;
 const SHEET_DETAIL_TTL_MS = 60000;
 const SEARCH_REQUEST_CACHE_MAX = 100;
 const SEARCH_FAILURE_MAX = 50;
+
+// 播放解析总预算：宿主对单个插件方法的沙箱上限约 10s，超限后 getMediaSource 既不会 resolve
+// 也不会 reject，播放器就一直停在当前曲目（用户看到的「卡住不切下一首」）。
+// 这里预留 1.5s 余量，保证一定在预算内给出结果或明确失败，让播放器继续往下走。
+const PLAYBACK_DEADLINE_MS = 8500;
+// 单阶段最小可用时间：剩余预算不足该值时直接跳过该阶段，不再发起注定超时的请求。
+const MEDIA_STAGE_MIN_MS = 900;
+// 跨源回退上限：历史实现会逐条串行递归整条解析链，一首歌能拖到几十秒。
+const MAX_CROSS_SOURCE_RECORDS = 2;
+const MAX_CROSS_SOURCE_SEARCH_SOURCES = 1;
 const requestCache = new Map();
 const requestsInFlight = new Map();
 const requestFailures = [];
@@ -476,6 +495,65 @@ function waitForRequestRetry() {
   return new Promise(function (resolve) { setTimeout(resolve, 200); });
 }
 
+function createDeadline(totalMs) {
+  return { expiresAt: Date.now() + (totalMs || PLAYBACK_DEADLINE_MS) };
+}
+
+function getDeadlineRemaining(deadline) {
+  if (!deadline || !deadline.expiresAt) return Infinity;
+  return deadline.expiresAt - Date.now();
+}
+
+function hasTimeForStage(deadline, stageMs) {
+  return getDeadlineRemaining(deadline) >= (stageMs || MEDIA_STAGE_MIN_MS);
+}
+
+// 兜底超时：底层请求即使全部悬挂，也必须在预算内 settle，不能把宿主方法挂死。
+function withDeadline(promise, deadline, message) {
+  return new Promise(function (resolve, reject) {
+    const budget = Math.max(0, getDeadlineRemaining(deadline));
+    const timer = setTimeout(function () {
+      const error = new Error(message || "playback resolve deadline exceeded");
+      error.code = "ETIMEDOUT";
+      reject(error);
+    }, budget);
+    Promise.resolve(promise).then(function (value) {
+      clearTimeout(timer);
+      resolve(value);
+    }, function (error) {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
+// 并发竞速取首个非空结果：任一路成功即返回，全部失败才 reject（等价 Promise.any，但保持 ES8）。
+function firstSuccessfulValue(promises) {
+  return new Promise(function (resolve, reject) {
+    let pending = promises.length;
+    let settled = false;
+    if (!pending) {
+      reject(new Error("no candidates"));
+      return;
+    }
+    function finish(value) {
+      if (settled) return;
+      settled = true;
+      if (value) resolve(value);
+      else reject(new Error("all candidates failed"));
+    }
+    function step() {
+      pending -= 1;
+      if (pending === 0) finish(null);
+    }
+    promises.forEach(function (promise) {
+      Promise.resolve(promise).then(function (value) {
+        if (value) finish(value);
+        else step();
+      }, function () { step(); });
+    });
+  });
+}
 function allSettled(promises) {
   return Promise.all(promises.map(function (promise) {
     return Promise.resolve(promise).then(function (value) {
@@ -854,7 +932,9 @@ async function fetchMultiSourceData(query, pageNum, sourceSetting) {
 /**
  * 瀑布流音频直链解析
  */
-async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossSource) {
+async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossSource, deadline) {
+  // 所有阶段与跨源回退共享同一条 deadline：超预算立即停止，不再逐级串行叠加。
+  const budget = deadline || createDeadline(PLAYBACK_DEADLINE_MS);
   const title = cleanString(
     musicItem.title ? musicItem.title.replace(/\[.*?\]/g, "") : "",
   );
@@ -864,7 +944,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
   const keyword = `${title} ${artist}`.trim();
 
   // 1. 自定义 API 接口
-  if (userVars.customApiUrl) {
+  if (userVars.customApiUrl && hasTimeForStage(budget, 2500)) {
     try {
       const customUrl = userVars.customApiUrl
         .replace("{id}", urlId)
@@ -890,7 +970,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
   }
 
   // 2. 酷我音乐直链解析 (antiserver.kuwo.cn 官方 CDN 接口)
-  if (source === "kuwo") {
+  if (source === "kuwo" && hasTimeForStage(budget, 1200)) {
     try {
       var rid = String(urlId).replace("MUSIC_", "");
       var kuwoDirectUrl = `https://antiserver.kuwo.cn/anti.s?type=convert_url3&rid=${rid}&format=mp3&response=url`;
@@ -917,7 +997,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
     const bilibiliBvid = String(urlId).split("|")[0];
     if (bilibiliBvid) {
       try {
-        const resolved = await resolveBilibiliMedia(bilibiliBvid);
+        const resolved = await resolveBilibiliMedia(bilibiliBvid, budget);
         if (resolved && resolved.url) return resolved;
       } catch (e) {}
     }
@@ -925,36 +1005,38 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
 
   // 3. 仅调用能保留原始平台 ID 与 source 的解析端点；
   // 跨平台关键词/网易云回退没有返回曲目元数据，不能安全替代请求曲目。
-  const engineApis = [
-    `https://music-api.gdstudio.xyz/api.php?types=url&id=${urlId}&source=${source}&use_xbridge3=true&loader_name=forest&need_sec_link=1&sec_link_scene=im&theme=light`,
-    `https://api.injahow.cn/meting/?type=url&id=${urlId}&server=${source}`,
-  ];
-
-  for (const apiUrl of engineApis) {
-    try {
-      const res = await mediaCoalesceGet(source, "engine-resolve", source + "|" + urlId, function () {
+  // 两个解析引擎并发竞速：任一路拿到直链即返回，不再串行等两次 4s 超时。
+  // cache key 必须带上引擎序号，否则 mediaCoalesceGet 的 in-flight 合并会把两路并成一路。
+  if (hasTimeForStage(budget, 1200)) {
+    const engineApis = [
+      "https://music-api.gdstudio.xyz/api.php?types=url&id=" + urlId + "&source=" + source + "&use_xbridge3=true&loader_name=forest&need_sec_link=1&sec_link_scene=im&theme=light",
+      "https://api.injahow.cn/meting/?type=url&id=" + urlId + "&server=" + source,
+    ];
+    const engineRequests = engineApis.map(function (apiUrl, index) {
+      return mediaCoalesceGet(source, "engine-resolve-" + index, source + "|" + urlId + "|" + index, function () {
         return axios.get(apiUrl, {
           headers: DEFAULT_HEADERS,
           timeout: 4000,
         });
-      });
-      const data = res ? res.data : null;
-      const url = data
-        ? data.url ||
-          (data.data && data.data.url) ||
-          (Array.isArray(data.data) && data.data[0] ? data.data[0].url : null)
-        : null;
-      if (url && typeof url === "string" && url.indexOf("http") === 0) {
-        return url;
-      }
-    } catch (e) {}
+      }).then(function (res) {
+        const data = res ? res.data : null;
+        const url = data
+          ? data.url ||
+            (data.data && data.data.url) ||
+            (Array.isArray(data.data) && data.data[0] ? data.data[0].url : null)
+          : null;
+        return url && typeof url === "string" && url.indexOf("http") === 0 ? url : null;
+      }).then(null, function () { return null; });
+    });
+    const engineUrl = await firstSuccessfulValue(engineRequests).then(null, function () { return null; });
+    if (engineUrl) return engineUrl;
   }
-
   // 4. 跨源回退：同一曲目在其它平台再试一次。
   // 依据 search 阶段按「标题+歌手+时长分桶」合并出的 sourceRecords，元数据已匹配，不会串歌。
   if (!skipCrossSource) {
-    const records = (musicItem.extra && musicItem.extra.sourceRecords) || [];
+    const records = ((musicItem.extra && musicItem.extra.sourceRecords) || []).slice(0, MAX_CROSS_SOURCE_RECORDS);
     for (const record of records) {
+      if (!hasTimeForStage(budget, 1200)) break;
       if (!record || !record.source || record.source === source) continue;
       try {
         const altItem = {
@@ -968,7 +1050,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
             lyric_id: record.lyric_id || record.id,
           },
         };
-        const altUrl = await fetchMediaUrlFromEngines(altItem, quality, userVars, true);
+        const altUrl = await fetchMediaUrlFromEngines(altItem, quality, userVars, true, budget);
         if (altUrl && typeof altUrl === "object" && altUrl.url) return altUrl;
         if (altUrl && typeof altUrl === "string" && altUrl.indexOf("http") === 0) {
           return altUrl;
@@ -986,8 +1068,13 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
       .split(" / ")[0]
       .toLowerCase()
       .replace(/\s+/g, "");
-    for (const altSource of ["netease", "kuwo"]) {
+    // 先排除自身再封顶：若直接对全表 slice，source=netease 时唯一候选会被自身跳过，回退形同关闭。
+    const crossSearchSources = ["netease", "kuwo"]
+      .filter(function (candidateSource) { return candidateSource !== source; })
+      .slice(0, MAX_CROSS_SOURCE_SEARCH_SOURCES);
+    for (const altSource of crossSearchSources) {
       if (altSource === source) continue;
+      if (!hasTimeForStage(budget, 2500)) break;
       try {
         const altList = await fetchMultiSourceData(wanted, 1, altSource);
         for (const cand of altList) {
@@ -1010,7 +1097,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
               lyric_id: cand.lyric_id || cand.id,
             },
           };
-          const altUrl = await fetchMediaUrlFromEngines(altItem, quality, userVars, true);
+          const altUrl = await fetchMediaUrlFromEngines(altItem, quality, userVars, true, budget);
           if (altUrl && typeof altUrl === "string" && altUrl.indexOf("http") === 0) {
             return altUrl;
           }
@@ -1025,7 +1112,7 @@ async function fetchMediaUrlFromEngines(musicItem, quality, userVars, skipCrossS
 module.exports = {
   // ===== 必填规范属性 =====
   platform: "通用聚合音源",
-  version: "4.1.3",
+  version: "4.1.4",
   author: "yzbtdmz1",
   srcUrl: "https://raw.githubusercontent.com/xiajiajun516/MusicFreePlugins/master/musicfree-aggregate-plugin.js",
   description:
@@ -1896,7 +1983,19 @@ module.exports = {
       }
     } catch (e) {}
 
-    const resolved = await fetchMediaUrlFromEngines(musicItem, quality, userVars);
+    // 硬预算：上游全部悬挂时也必须在预算内 settle。历史实现没有任何总超时，
+    // 一旦串行回退链超过宿主沙箱上限，播放器就永远等不到结果（表现为卡住不切歌）。
+    const deadline = createDeadline(PLAYBACK_DEADLINE_MS);
+    let resolved;
+    try {
+      resolved = await withDeadline(
+        fetchMediaUrlFromEngines(musicItem, quality, userVars, false, deadline),
+        deadline
+      );
+    } catch (error) {
+      recordRequestFailure((musicItem.extra && musicItem.extra.source) || "netease", "media-url", error);
+      throw error;
+    }
     // B 站等来源需要随直链下发请求头（CDN 无 Referer 会 403）
     if (resolved && typeof resolved === "object") {
       const result = { url: resolved.url };
@@ -1905,7 +2004,6 @@ module.exports = {
     }
     return { url: resolved };
   },
-
   // ===== 歌词获取 =====
   async getLyric(musicItem) {
     const source = (musicItem.extra && musicItem.extra.source) || "netease";

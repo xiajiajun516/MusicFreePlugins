@@ -3,6 +3,26 @@
 记录 `musicfree-aggregate-plugin.js` 的对外行为变更。
 版本号写在该脚本的 `version` 字段，遵循语义化版本：**主版本** = 来源集合或用户变量的破坏性变更，**次版本** = 新增来源 / 新能力，**修订号** = 修复。
 
+## [4.1.4] - 2026-11-04
+
+### 修复
+
+- **修复听歌时偶发「卡住不切下一首」（播放在解析阶段永久挂起）**。根因是 `getMediaSource` 没有任何总超时，而解析瀑布链（自定义接口 → 酷我直链 → 两个解析引擎 → 跨源同曲记录 → 跨源检索回退）全程串行、逐级叠加超时，最坏可达数十秒；宿主对单个插件方法的执行上限约 10 秒，超限后既拿不到直链也拿不到失败，播放器就停在当前曲目不再前进。
+  - `getMediaSource` 增加**总预算**（`PLAYBACK_DEADLINE_MS = 8500`，为宿主 10s 上限预留余量），超预算必定以 `ETIMEDOUT` 明确失败，让播放器立刻跳过该曲而不是卡死。
+  - 解析链每一阶段前用 `hasTimeForStage` 检查剩余预算（自定义接口 2500ms / 酷我直链 1200ms / 解析引擎 1200ms / 每条跨源记录 1200ms / 跨源检索 2500ms），预算不足直接跳过，不再发起注定超时的请求。
+  - 两个解析引擎（gdstudio、injahow）由**串行改为并发竞速**，首个拿到直链即返回；竞速用的 in-flight key 带引擎序号，避免被 `mediaCoalesceGet` 的并发合并压成一路。
+  - 跨源回退**封顶**：同曲记录最多尝试 `MAX_CROSS_SOURCE_RECORDS = 2` 条，跨源检索回退最多 `MAX_CROSS_SOURCE_SEARCH_SOURCES = 1` 个来源，且全部共享同一条预算。
+- **Bilibili 首次播放必超预算**：cookie（`x/frontend/finger/spi`）与 wbi mixinKey（`x/web-interface/nav`）原先串行请求，各自 2.5s 超时叠加 pagelist 3.5s + playurl 4s，首播理论耗时 12.5s。现改为并行预取（各自失败独立兜底为空串），并在 pagelist / playurl 前做预算守门。
+
+### 测试
+
+- 新增 5 个离线回归用例（`test-aggregate.js`，共 46 个）：
+  - `p5-playback-deadline`：所有阶段永久悬挂时，`getMediaSource` 必须在 9.5s 内以 `ETIMEDOUT` settle。
+  - `p5-playback-engine-race`：慢引擎悬挂时快引擎必须直接胜出，两个引擎同时发起。
+  - `p5-playback-cross-source-cap`：跨源记录封顶 2 条，第 3 条不得再发请求。
+  - `p5-playback-bilibili-parallel`：cookie 与 mixinKey 必须并行预取（发起间隔 < 120ms），直链仍带 Referer。
+  - `p5-playback-cross-search`：跨源检索回退在封顶后仍对「非自身来源」生效（候选源先排除自身再截断）。
+
 ## [4.1.3] - 2026-09-30
 
 ### 变更
